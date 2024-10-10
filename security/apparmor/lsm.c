@@ -2222,6 +2222,10 @@ static void __init aa_teardown_dfa_engine(void)
 	nulldfa = NULL;
 }
 
+struct lsm_ops apparmor_ops = {
+	.load_policy = aa_profile_load_current_ns,
+};
+
 static int __init apparmor_init(void)
 {
 	int error;
@@ -2258,7 +2262,7 @@ static int __init apparmor_init(void)
 		goto buffers_out;
 	}
 	security_add_hooks(apparmor_hooks, ARRAY_SIZE(apparmor_hooks),
-				&apparmor_lsmid, NULL);
+				&apparmor_lsmid, &apparmor_ops);
 
 	/* Report that AppArmor successfully initialized */
 	apparmor_initialized = 1;
