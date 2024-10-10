@@ -435,7 +435,6 @@ static struct security_hook_list yama_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(task_free, yama_task_free),
 };
 
-#ifdef CONFIG_SYSCTL
 static int yama_dointvec_minmax(const struct ctl_table *table, int write,
 				void *buffer, size_t *lenp, loff_t *ppos)
 {
@@ -465,6 +464,24 @@ static struct ctl_table yama_sysctl_table[] = {
 		.extra2         = &max_scope,
 	},
 };
+#ifdef CONFIG_SYSCTL
+static ssize_t yama_load_policy(const void __user *buf, size_t size, loff_t *ppos)
+{
+	char val;
+
+	if (size < 1)
+		return -EINVAL;
+
+	get_user(val, (char *)buf);
+	size = 1;
+
+	return yama_dointvec_minmax(yama_sysctl_table, true, &val, &size, ppos);
+}
+
+struct lsm_ops yama_ops __ro_after_init = {
+	.load_policy = yama_load_policy,
+};
+
 static void __init yama_init_sysctl(void)
 {
 	if (!register_sysctl("kernel/yama", yama_sysctl_table))
@@ -477,7 +494,7 @@ static inline void yama_init_sysctl(void) { }
 static int __init yama_init(void)
 {
 	pr_info("Yama: becoming mindful.\n");
-	security_add_hooks(yama_hooks, ARRAY_SIZE(yama_hooks), &yama_lsmid, NULL);
+	security_add_hooks(yama_hooks, ARRAY_SIZE(yama_hooks), &yama_lsmid, &yama_ops);
 	yama_init_sysctl();
 	return 0;
 }
