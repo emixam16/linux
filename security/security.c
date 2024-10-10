@@ -608,11 +608,12 @@ static int lsm_append(const char *new, char **result)
  * @hooks: the hooks to add
  * @count: the number of hooks to add
  * @lsmid: the identification information for the security module
+ * @lsm_ops: the operations supported by this lsm. Can be NULL
  *
  * Each LSM has to register its hooks with the infrastructure.
  */
 void __init security_add_hooks(struct security_hook_list *hooks, int count,
-			       const struct lsm_id *lsmid)
+			       const struct lsm_id *lsmid, const struct lsm_ops *ops)
 {
 	int i;
 
@@ -625,6 +626,7 @@ void __init security_add_hooks(struct security_hook_list *hooks, int count,
 	if (lsm_active_cnt == 0 || lsm_idlist[lsm_active_cnt - 1] != lsmid) {
 		if (lsm_active_cnt >= MAX_LSM_COUNT)
 			panic("%s Too many LSMs registered.\n", __func__);
+		lsm_ops_list[lsm_active_cnt] = ops;
 		lsm_idlist[lsm_active_cnt++] = lsmid;
 	}
 
@@ -862,6 +864,28 @@ static int lsm_superblock_alloc(struct super_block *sb)
 	return lsm_blob_alloc(&sb->s_security, blob_sizes.lbs_superblock,
 			      GFP_KERNEL);
 }
+
+static const struct lsm_ops *get_lsm_ops_from_id(u64 id)
+{
+	for(int i = 0; i < lsm_active_cnt; ++i)
+		if (lsm_idlist[i]->id == id)
+			return lsm_ops_list[i];
+
+	return NULL;
+}
+
+ssize_t lsm_load_policy(int id, const void __user *buf, size_t size, loff_t *pos)
+{
+	const struct lsm_ops* ops = get_lsm_ops_from_id(id);
+
+	if (!ops)
+		return -EINVAL;
+	if (!ops->load_policy)
+		return -ENOTSUPP;
+
+	return ops->load_policy(buf, size, pos);
+}
+
 
 /**
  * lsm_fill_user_ctx - Fill a user space lsm_ctx structure

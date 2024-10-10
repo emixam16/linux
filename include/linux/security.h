@@ -169,6 +169,7 @@ struct lsm_prop {
 extern const char *const lockdown_reasons[LOCKDOWN_CONFIDENTIALITY_MAX+1];
 extern u32 lsm_active_cnt;
 extern const struct lsm_id *lsm_idlist[];
+extern const struct lsm_ops *lsm_ops_list[];
 
 /* These functions are in security/commoncap.c */
 extern int cap_capable(const struct cred *cred, struct user_namespace *ns,
@@ -583,6 +584,7 @@ int security_bdev_setintegrity(struct block_device *bdev,
 			       size_t size);
 int security_lsm_manage_policies(u32 lsm_id, u32 op, void __user *buf,
                                  u32 __user *size, u32 flags);
+ssize_t lsm_load_policy(int id, const void __user *buf, size_t size, loff_t *pos);
 #else /* CONFIG_SECURITY */
 
 /**
@@ -1606,7 +1608,11 @@ static inline int security_bdev_setintegrity(struct block_device *bdev,
 }
 static int security_lsm_manage_policies(u32 lsm_id, u32 op, void __user *buf,
                                         u32 __user *size, u32 flags)
-
+{
+	return -EOPNOTSUPP;
+}
+ssize_t lsm_load_policy(int id, const void __user *buf, size_t size, loff_t *pos)
+{
 	return -EOPNOTSUPP;
 }
 

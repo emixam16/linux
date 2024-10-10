@@ -278,7 +278,7 @@ static int __init safesetid_security_init(void)
 {
 	security_add_hooks(safesetid_security_hooks,
 			   ARRAY_SIZE(safesetid_security_hooks),
-			   &safesetid_lsmid);
+			   &safesetid_lsmid, NULL);
 
 	/* Report that SafeSetID successfully initialized */
 	safesetid_initialized = 1;
