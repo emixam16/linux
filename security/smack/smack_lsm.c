@@ -5269,7 +5269,8 @@ static __init int smack_init(void)
 	/*
 	 * Register with LSM
 	 */
-	security_add_hooks(smack_hooks, ARRAY_SIZE(smack_hooks), &smack_lsmid);
+	security_add_hooks(smack_hooks, ARRAY_SIZE(smack_hooks), &smack_lsmid,
+			NULL);
 	smack_enabled = 1;
 
 	pr_info("Smack:  Initializing.\n");

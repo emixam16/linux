@@ -1164,7 +1164,7 @@ static const struct lsm_id evm_lsmid = {
 
 static int __init init_evm_lsm(void)
 {
-	security_add_hooks(evm_hooks, ARRAY_SIZE(evm_hooks), &evm_lsmid);
+	security_add_hooks(evm_hooks, ARRAY_SIZE(evm_hooks), &evm_lsmid, NULL);
 	return 0;
 }
 

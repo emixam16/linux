@@ -117,7 +117,8 @@ extern struct security_hook_heads security_hook_heads;
 extern char *lsm_names;
 
 extern void security_add_hooks(struct security_hook_list *hooks, int count,
-			       const struct lsm_id *lsmid);
+			       const struct lsm_id *lsmid,
+			       const struct lsm_ops *lsmops);
 
 #define LSM_FLAG_LEGACY_MAJOR	BIT(0)
 #define LSM_FLAG_EXCLUSIVE	BIT(1)
@@ -126,6 +127,10 @@ enum lsm_order {
 	LSM_ORDER_FIRST = -1,	/* This is only for capabilities. */
 	LSM_ORDER_MUTABLE = 0,
 	LSM_ORDER_LAST = 1,	/* This is only for integrity. */
+};
+struct lsm_ops {
+	ssize_t (*load_policy)(const void __user *buf,
+			       size_t size, loff_t *pos);
 };
 
 struct lsm_info {

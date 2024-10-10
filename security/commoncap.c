@@ -1470,7 +1470,7 @@ static struct security_hook_list capability_hooks[] __ro_after_init = {
 static int __init capability_init(void)
 {
 	security_add_hooks(capability_hooks, ARRAY_SIZE(capability_hooks),
-			   &capability_lsmid);
+			   &capability_lsmid, NULL);
 	return 0;
 }
 

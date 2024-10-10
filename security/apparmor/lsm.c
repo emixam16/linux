@@ -2258,7 +2258,7 @@ static int __init apparmor_init(void)
 		goto buffers_out;
 	}
 	security_add_hooks(apparmor_hooks, ARRAY_SIZE(apparmor_hooks),
-				&apparmor_lsmid);
+				&apparmor_lsmid, NULL);
 
 	/* Report that AppArmor successfully initialized */
 	apparmor_initialized = 1;

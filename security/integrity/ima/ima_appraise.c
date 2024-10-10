@@ -820,5 +820,5 @@ static struct security_hook_list ima_appraise_hooks[] __ro_after_init = {
 void __init init_ima_appraise_lsm(const struct lsm_id *lsmid)
 {
 	security_add_hooks(ima_appraise_hooks, ARRAY_SIZE(ima_appraise_hooks),
-			   lsmid);
+			   lsmid, NULL);
 }

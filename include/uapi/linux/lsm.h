@@ -89,4 +89,13 @@ struct lsm_ctx {
  */
 #define LSM_FLAG_SINGLE	0x0001
 
+/*
+ * LSM_POLICY_XXX definition identifies operation to manage lsm
+ * policies
+ */
+#define LSM_POLICY_UNDEF	0
+#define LSM_POLICY_LOAD		100
+#define LSM_POLICY_REMOVE	101
+#define LSM_POLICY_REPLACE	102
+
 #endif /* _UAPI_LINUX_LSM_H */

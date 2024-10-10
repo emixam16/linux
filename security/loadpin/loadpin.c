@@ -265,7 +265,7 @@ static int __init loadpin_init(void)
 		pr_notice("sysctl registration failed!\n");
 #endif
 	security_add_hooks(loadpin_hooks, ARRAY_SIZE(loadpin_hooks),
-			   &loadpin_lsmid);
+			   &loadpin_lsmid, NULL);
 
 	return 0;
 }

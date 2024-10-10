@@ -143,6 +143,7 @@ enum lockdown_reason {
 extern const char *const lockdown_reasons[LOCKDOWN_CONFIDENTIALITY_MAX+1];
 extern u32 lsm_active_cnt;
 extern const struct lsm_id *lsm_idlist[];
+extern const struct lsm_ops *lsm_ops_list[];
 
 /* These functions are in security/commoncap.c */
 extern int cap_capable(const struct cred *cred, struct user_namespace *ns,
@@ -509,6 +510,7 @@ int security_inode_getsecctx(struct inode *inode, void **ctx, u32 *ctxlen);
 int security_locked_down(enum lockdown_reason what);
 int lsm_fill_user_ctx(struct lsm_ctx __user *uctx, u32 *uctx_len,
 		      void *val, size_t val_len, u64 id, u64 flags);
+ssize_t lsm_load_policy(int id, const void __user *buf, size_t size, loff_t *pos);
 #else /* CONFIG_SECURITY */
 
 static inline int call_blocking_lsm_notifier(enum lsm_event event, void *data)
@@ -1480,6 +1482,10 @@ static inline int security_locked_down(enum lockdown_reason what)
 static inline int lsm_fill_user_ctx(struct lsm_ctx __user *uctx,
 				    u32 *uctx_len, void *val, size_t val_len,
 				    u64 id, u64 flags)
+{
+	return -EOPNOTSUPP;
+}
+ssize_t lsm_load_policy(int id, const void __user *buf, size_t size, loff_t *pos)
 {
 	return -EOPNOTSUPP;
 }

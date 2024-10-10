@@ -122,5 +122,16 @@ SYSCALL_DEFINE3(lsm_list_modules, u64 __user *, ids, u32 __user *, size,
 SYSCALL_DEFINE5(lsm_manage_policy, u32, lsm_id, u32, op, void __user *, buf, u32
 		__user *, size, u32, flags)
 {
-	return 0;
+	loff_t pos = 0; // Currently, no support for partial loading
+	int usize;
+
+	if (get_user(usize, size))
+		return -EFAULT;
+
+	switch (op) {
+	case LSM_POLICY_LOAD:
+		return lsm_load_policy(lsm_id, buf, usize, &pos);
+	default:
+		return -ENOSYS;
+	}
 }
