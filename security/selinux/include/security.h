@@ -210,6 +210,7 @@ void selinux_policy_cancel(struct selinux_load_state *load_state);
 int security_read_policy(void **data, size_t *len);
 int security_read_state_kernel(void **data, size_t *len);
 int security_policycap_supported(unsigned int req_cap);
+ssize_t sel_profile_load(const void __user *buf, size_t count, loff_t *ppos);
 
 #define SEL_VEC_MAX 32
 struct av_decision {
