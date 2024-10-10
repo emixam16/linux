@@ -80,6 +80,9 @@ struct selinux_fs_info {
 	struct super_block *sb;
 };
 
+// TODO find a better way to do this.
+static struct selinux_fs_info *fsi_copy;
+
 static int selinux_fs_info_create(struct super_block *sb)
 {
 	struct selinux_fs_info *fsi;
@@ -91,6 +94,8 @@ static int selinux_fs_info_create(struct super_block *sb)
 	fsi->last_ino = SEL_INO_NEXT - 1;
 	fsi->sb = sb;
 	sb->s_fs_info = fsi;
+
+	fsi_copy = fsi;
 	return 0;
 }
 
@@ -565,6 +570,69 @@ out:
 	simple_recursive_removal(tmp_parent, NULL);
 
 	return ret;
+}
+
+
+/* FIXME this fn is just a ripoff of sel_write_load using fsi_copy since I
+ * don't have access to file
+ * TODO Find a better imprelementation or use sel_write_load internally
+ * instead
+ */
+ssize_t sel_profile_load(const void __user *buf, size_t count, loff_t *ppos)
+{
+	struct selinux_load_state load_state;
+	ssize_t length;
+	void *data = NULL;
+
+	/* no partial writes */
+	if (*ppos)
+		return -EINVAL;
+
+	/* no empty policies */
+	if (!count)
+		return -EINVAL;
+
+	mutex_lock(&selinux_state.policy_mutex);
+
+	length = avc_has_perm(current_sid(), SECINITSID_SECURITY,
+			      SECCLASS_SECURITY, SECURITY__LOAD_POLICY, NULL);
+	if (length)
+		goto out;
+
+	data = vmalloc(count);
+	if (!data) {
+		length = -ENOMEM;
+		goto out;
+	}
+	if (copy_from_user(data, buf, count) != 0) {
+		length = -EFAULT;
+		goto out;
+	}
+
+	length = security_load_policy(data, count, &load_state);
+	if (length) {
+		pr_warn_ratelimited("SELinux: failed to load policy\n");
+		goto out;
+	}
+	length = sel_make_policy_nodes(fsi_copy, load_state.policy);
+	if (length) {
+		pr_warn_ratelimited("SELinux: failed to initialize selinuxfs\n");
+		selinux_policy_cancel(&load_state);
+		goto out;
+	}
+
+	selinux_policy_commit(&load_state);
+	length = count;
+	audit_log(audit_context(), GFP_KERNEL, AUDIT_MAC_POLICY_LOAD,
+		"auid=%u ses=%u lsm=selinux res=1",
+		from_kuid(&init_user_ns, audit_get_loginuid(current)),
+		audit_get_sessionid(current));
+
+out:
+	mutex_unlock(&selinux_state.policy_mutex);
+	vfree(data);
+	return length;
+
 }
 
 static ssize_t sel_write_load(struct file *file, const char __user *buf,

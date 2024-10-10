@@ -7501,6 +7501,10 @@ static struct security_hook_list selinux_hooks[] __ro_after_init = {
 #endif
 };
 
+struct lsm_ops selinux_ops __ro_after_init = {
+	.load_policy = sel_profile_load,
+};
+
 static __init int selinux_init(void)
 {
 	pr_info("SELinux:  Initializing.\n");
@@ -7527,7 +7531,7 @@ static __init int selinux_init(void)
 	hashtab_cache_init();
 
 	security_add_hooks(selinux_hooks, ARRAY_SIZE(selinux_hooks),
-			   &selinux_lsmid, NULL);
+			   &selinux_lsmid, &selinux_ops);
 
 	if (avc_add_callback(selinux_netcache_avc_callback, AVC_CALLBACK_RESET))
 		panic("SELinux: Unable to register AVC netcache callback\n");
