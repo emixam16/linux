@@ -5883,6 +5883,25 @@ int security_bdev_setintegrity(struct block_device *bdev,
 }
 EXPORT_SYMBOL(security_bdev_setintegrity);
 
+/**
+ * security_lsm_manage_policies() - Manage the policies of LSMs
+ * @lsm_id: u32 The id of the lsm to which policies must be updated
+ * @op: Operation to perform
+ * @buf: The lsm-dependant data to perform
+ * @size: size of @buf
+ * @flags: Flags, if supported
+ *
+ * TODO Do this documentation.
+ *
+ * Return: Returns 0 on success, negative values on failure.
+ */
+int security_lsm_manage_policies(u32 lsm_id, u32 op, void __user *buf,
+                                 u32 __user *size, u32 flags)
+{
+	return call_int_hook(lsm_manage_policies, lsm_id, op, buf, size, flags);
+}
+EXPORT_SYMBOL(security_lsm_manage_policies);
+
 #ifdef CONFIG_PERF_EVENTS
 /**
  * security_perf_event_open() - Check if a perf event open is allowed
