@@ -65,6 +65,7 @@ struct aa_ns {
 	struct aa_profile *unconfined;
 	struct list_head sub_ns;
 	atomic_t uniq_null;
+	atomic_t self_policy_task_refs;
 	long uniq_id;
 	int level;
 	long revision;
@@ -128,6 +129,21 @@ static inline void aa_put_ns(struct aa_ns *ns)
 	if (ns)
 		aa_put_profile(ns->unconfined);
 }
+
+/**
+ * aa_self_policy_ns_get - take a task-ref on a transient self_policy ns
+ * @ns: transient namespace to reference (MAY BE NULL)
+ *
+ */
+static inline void aa_self_policy_ns_get(struct aa_ns *ns)
+{
+	if (ns) {
+		aa_get_ns(ns);
+		atomic_inc(&ns->self_policy_task_refs);
+	}
+}
+
+void aa_self_policy_ns_put(struct aa_ns *ns);
 
 /**
  * __aa_findn_ns - find a namespace on a list by @name

@@ -23,6 +23,7 @@
 #include <linux/netfilter_ipv4.h>
 #include <linux/netfilter_ipv6.h>
 #include <linux/zstd.h>
+#include <linux/random.h>
 #include <net/sock.h>
 #include <uapi/linux/mount.h>
 #include <uapi/linux/lsm.h>
@@ -1485,6 +1486,214 @@ static int apparmor_socket_shutdown(struct socket *sock, int how)
 	return aa_sock_perm(OP_SHUTDOWN, AA_MAY_SHUTDOWN, sock);
 }
 
+/*
+ * Maximum length of the synthesized name for a task's transient
+ * self_policy namespace: "self." + 10 decimal digits of pid + "." +
+ * 16 hex digits of randomness + NUL.
+ */
+#define AA_SELF_POLICY_NS_NAME_LEN 33
+
+/**
+ * apparmor_stack_self_policy_profiles - stack all profiles in @ns onto current
+ * @ns: transient self_policy namespace whose profiles to apply
+ *
+ * Snapshots the profile list of @ns under @ns->lock, then merges each
+ * profile's label into the calling task's current label and installs
+ * the result via aa_replace_current_label().
+ *
+ * Returns: 0 on success or if @ns has no profiles, negative errno on
+ * allocation failure.
+ */
+static int apparmor_stack_self_policy_profiles(struct aa_ns *ns)
+{
+	struct aa_label *current_label = NULL;
+	struct aa_label *new_label = NULL;
+	struct aa_profile **snapshot = NULL;
+	struct aa_profile *profile;
+	int n = 0, i = 0, error = 0;
+
+	mutex_lock_nested(&ns->lock, ns->level);
+	list_for_each_entry(profile, &ns->base.profiles, base.list)
+		n++;
+	if (n == 0) {
+		mutex_unlock(&ns->lock);
+		return 0;
+	}
+	snapshot = kcalloc(n, sizeof(*snapshot), GFP_KERNEL);
+	if (!snapshot) {
+		mutex_unlock(&ns->lock);
+		return -ENOMEM;
+	}
+	list_for_each_entry(profile, &ns->base.profiles, base.list) {
+		if (i >= n)
+			break;
+		snapshot[i++] = aa_get_profile(profile);
+	}
+	mutex_unlock(&ns->lock);
+
+	current_label = aa_get_current_label();
+	new_label = aa_get_label(current_label);
+
+	for (i = 0; i < n; i++) {
+		struct aa_label *merged = aa_label_merge(new_label,
+							 &snapshot[i]->label,
+							 GFP_KERNEL);
+		aa_put_label(new_label);
+		if (IS_ERR(merged)) {
+			error = PTR_ERR(merged);
+			new_label = NULL;
+			break;
+		}
+		new_label = merged;
+	}
+
+	if (!error && new_label && new_label != current_label)
+		error = aa_replace_current_label(new_label);
+
+	for (i = 0; i < n; i++)
+		aa_put_profile(snapshot[i]);
+	kfree(snapshot);
+	aa_put_label(current_label);
+	if (new_label)
+		aa_put_label(new_label);
+	return error;
+}
+
+/**
+ * apparmor_get_or_alloc_self_policy_ns - get the calling task's transient
+ * self_policy namespace, allocating it on first use
+ * @ctx: the calling task's aa_task_ctx (must be the current task's ctx)
+ *
+ * On first invocation by a task (and its descendants that inherited the
+ * task ctx via aa_dup_task_ctx()), allocates a fresh sub-namespace under
+ * the caller's current AppArmor namespace and stores a reference to it
+ * in @ctx->self_policy_ns.
+ *
+ * The returned pointer is owned by @ctx; callers must not aa_put_ns()
+ * it. The reference is released when the task (and all forked
+ * descendants) exit and their ctxs are freed.
+ *
+ * Returns: pointer to the namespace on success, ERR_PTR on failure.
+ */
+static struct aa_ns *apparmor_get_or_alloc_self_policy_ns(struct aa_task_ctx *ctx)
+{
+	struct aa_ns *current_ns;
+	struct aa_ns *self_ns;
+	char ns_name[AA_SELF_POLICY_NS_NAME_LEN];
+
+	if (ctx->self_policy_ns)
+		return ctx->self_policy_ns;
+
+	current_ns = aa_get_current_ns();
+
+	snprintf(ns_name, sizeof(ns_name), "self.%u.%016llx",
+		 current->pid,
+		 (unsigned long long)get_random_u64());
+
+	mutex_lock_nested(&current_ns->lock, current_ns->level);
+	self_ns = __aa_find_or_create_ns(current_ns, ns_name, NULL);
+	mutex_unlock(&current_ns->lock);
+
+	aa_put_ns(current_ns);
+
+	if (IS_ERR(self_ns))
+		return self_ns;
+
+	/* This task ctx now holds the first task-ref to the new ns. */
+	atomic_set(&self_ns->self_policy_task_refs, 1);
+	ctx->self_policy_ns = self_ns; /* hold the ref in the task ctx */
+	return self_ns;
+}
+
+/**
+ * apparmor_lsm_config_self_policy - Load policy reserved for the calling task
+ * @op: operation to perform. Currently, only LSM_POLICY_LOAD is supported.
+ * @buf: user-supplied buffer containing the policy to load.
+ * @size: size of @buf
+ * @flags: reserved for future use; must be zero
+ *
+ * Loads policy into a transient AppArmor namespace owned by the calling
+ * task and inherited by its descendants.
+ *
+ * After a successful load every profile in the transient namespace is
+ * stacked onto the calling task's label.
+ *
+ * Returns: 0 on success, negative value on error
+ */
+static int apparmor_lsm_config_self_policy(u32 op, void __user *buf,
+					   size_t size, u32 flags)
+{
+	struct aa_task_ctx *ctx = task_ctx(current);
+	struct aa_ns *self_ns;
+	loff_t pos = 0; /* Partial writing is not currently supported */
+	int error;
+
+	if (op != LSM_POLICY_LOAD || flags)
+		return -EOPNOTSUPP;
+	if (size == 0)
+		return -EINVAL;
+	if (size > AA_PROFILE_MAX_SIZE)
+		return -E2BIG;
+	/*
+	 * Respect the global policy lockdown (apparmor.lock_policy=Y). The
+	 * unprivileged LOAD path bypasses aa_may_manage_policy() where this
+	 * is normally checked, so we must enforce it explicitly here.
+	 */
+	if (aa_g_lock_policy)
+		return -EACCES;
+
+	self_ns = apparmor_get_or_alloc_self_policy_ns(ctx);
+	if (IS_ERR(self_ns))
+		return PTR_ERR(self_ns);
+
+	error = aa_profile_load_self(false, self_ns, buf, size, &pos);
+	if (error)
+		return error;
+
+	return apparmor_stack_self_policy_profiles(self_ns);
+}
+
+/**
+ * apparmor_lsm_config_system_policy - Load a system policy
+ * @op: operation to perform. Currently, only LSM_POLICY_LOAD is supported
+ * @buf: user-supplied buffer in the form "<ns>\0<policy>"
+ *        <ns> is the namespace to load the policy into, relative to the
+ *        caller's current AppArmor namespace (empty string for the caller's
+ *        current namespace). A task confined to a sub-namespace cannot
+ *        target a sibling or parent namespace.
+ *        <policy> is the policy to load
+ * @size: size of @buf
+ * @flags: reserved for future uses; must be zero
+ *
+ * Returns: 0 on success, negative value on error
+ */
+static int apparmor_lsm_config_system_policy(u32 op, void __user *buf,
+					     size_t size, u32 flags)
+{
+	loff_t pos = 0; /* Partial writing is not currently supported */
+	char ns_name[AA_PROFILE_NAME_MAX_SIZE];
+	size_t ns_size;
+	size_t max_ns_size = min(size, AA_PROFILE_NAME_MAX_SIZE);
+
+	if (op != LSM_POLICY_LOAD || flags)
+		return -EOPNOTSUPP;
+	if (size < 2)
+		return -EINVAL;
+	if (size > AA_PROFILE_MAX_SIZE)
+		return -E2BIG;
+
+	ns_size = strncpy_from_user(ns_name, buf, max_ns_size);
+	if (ns_size < 0)
+		return ns_size;
+	if (ns_size == max_ns_size)
+		return -E2BIG;
+
+	return aa_profile_load_ns_name(false, ns_name, ns_size,
+				       buf + ns_size + 1,
+				       size - ns_size - 1, &pos);
+}
+
+
 #ifdef CONFIG_NETWORK_SECMARK
 /**
  * apparmor_socket_sock_rcv_skb - check perms before associating skb to sk
@@ -1712,6 +1921,10 @@ static struct security_hook_list apparmor_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(socket_getsockopt, apparmor_socket_getsockopt),
 	LSM_HOOK_INIT(socket_setsockopt, apparmor_socket_setsockopt),
 	LSM_HOOK_INIT(socket_shutdown, apparmor_socket_shutdown),
+
+	LSM_HOOK_INIT(lsm_config_self_policy, apparmor_lsm_config_self_policy),
+	LSM_HOOK_INIT(lsm_config_system_policy,
+		      apparmor_lsm_config_system_policy),
 #ifdef CONFIG_NETWORK_SECMARK
 	LSM_HOOK_INIT(socket_sock_rcv_skb, apparmor_socket_sock_rcv_skb),
 #endif

@@ -155,14 +155,14 @@ void aa_ploaddata_kref(struct kref *kref)
 	}
 }
 
-struct aa_loaddata *aa_loaddata_alloc(size_t size)
+struct aa_loaddata *aa_loaddata_alloc(size_t size, gfp_t flags)
 {
 	struct aa_loaddata *d;
 
-	d = kzalloc_obj(*d);
+	d = kzalloc_obj(*d, flags);
 	if (d == NULL)
 		return ERR_PTR(-ENOMEM);
-	d->data = kvzalloc(size, GFP_KERNEL);
+	d->data = kvzalloc(size, flags);
 	if (!d->data) {
 		kfree(d);
 		return ERR_PTR(-ENOMEM);

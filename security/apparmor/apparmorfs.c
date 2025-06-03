@@ -447,6 +447,9 @@ static void aafs_remove(struct dentry *dentry)
  * @alloc_size: size of user buffer (REQUIRES: @alloc_size >= @copy_size)
  * @copy_size: size of data to copy from user buffer
  * @pos: position write is at in the file (NOT NULL)
+ * @gfp: allocation flags for the loaddata buffer; pass GFP_KERNEL_ACCOUNT
+ *	 for paths reachable by unprivileged callers so the allocation is
+ *	 charged to the calling task's memcg.
  *
  * Returns: kernel buffer containing copy of user buffer data or an
  *          ERR_PTR on failure.
@@ -454,7 +457,7 @@ static void aafs_remove(struct dentry *dentry)
 static struct aa_loaddata *aa_simple_write_to_buffer(const char __user *userbuf,
 						     size_t alloc_size,
 						     size_t copy_size,
-						     loff_t *pos)
+						     loff_t *pos, gfp_t gfp)
 {
 	struct aa_loaddata *data;
 
@@ -465,7 +468,7 @@ static struct aa_loaddata *aa_simple_write_to_buffer(const char __user *userbuf,
 		return ERR_PTR(-ESPIPE);
 
 	/* freed by caller to simple_write_to_buffer */
-	data = aa_loaddata_alloc(alloc_size);
+	data = aa_loaddata_alloc(alloc_size, gfp);
 	if (IS_ERR(data))
 		return data;
 
@@ -496,7 +499,7 @@ static ssize_t policy_update(u32 mask, const char __user *buf, size_t size,
 	if (error)
 		goto end_section;
 
-	data = aa_simple_write_to_buffer(buf, size, size, pos);
+	data = aa_simple_write_to_buffer(buf, size, size, pos, GFP_KERNEL);
 	error = PTR_ERR(data);
 	if (!IS_ERR(data)) {
 		error = aa_replace_profiles(ns, label, mask, data);
@@ -507,6 +510,119 @@ static ssize_t policy_update(u32 mask, const char __user *buf, size_t size,
 	}
 end_section:
 	end_current_label_crit_section(label);
+
+	return error;
+}
+
+/**
+ * aa_profile_load_into_ns - load a profile into a specific namespace
+ * @allow_replace: allow replacing profiles
+ * @ns: target namespace; caller holds a reference
+ * @buf: buffer containing the user-provided policy
+ * @size: size of @buf
+ * @ppos: position pointer in the file
+ *
+ * Returns: 0 on success, negative value on error
+ */
+ssize_t aa_profile_load_into_ns(bool allow_replace, struct aa_ns *ns,
+				const void __user *buf, size_t size,
+				loff_t *ppos)
+{
+	u32 mask = AA_MAY_LOAD_POLICY;
+	int error;
+
+	AA_BUG(!ns);
+
+	if (allow_replace)
+		mask |= AA_MAY_REPLACE_POLICY;
+
+	error = policy_update(mask, buf, size, ppos, ns, NULL);
+
+	return error >= 0 ? 0 : error;
+}
+
+/**
+ * aa_profile_load_self - load a profile into a caller-owned namespace
+ * @allow_replace: allow replacing profiles
+ * @ns: target namespace owned by the calling task
+ * @buf: buffer containing the user-provided policy
+ * @size: size of @buf
+ * @ppos: position pointer in the file
+ *
+ * Loaded policies are stacked so this function can be called without
+ * CAP_MAC_ADMIN if @allow_replace == false
+ *
+ * Returns: 0 on success, negative value on error
+ */
+ssize_t aa_profile_load_self(bool allow_replace, struct aa_ns *ns,
+			     const void __user *buf, size_t size,
+			     loff_t *ppos)
+{
+	struct aa_loaddata *data;
+	struct aa_label *label;
+	u32 mask = AA_MAY_LOAD_POLICY;
+	ssize_t error;
+
+	AA_BUG(!ns);
+
+	if (allow_replace)
+		mask |= AA_MAY_REPLACE_POLICY;
+
+	label = begin_current_label_crit_section();
+
+	/*
+	 * This helper is the load path for lsm_config_self_policy(), reachable
+	 * by unprivileged callers. Charge the policy buffer to the caller's
+	 * memcg so a malicious task can't DoS the host by minting many large
+	 * unaccounted allocations.
+	 */
+	data = aa_simple_write_to_buffer(buf, size, size, ppos,
+					 GFP_KERNEL_ACCOUNT);
+	error = PTR_ERR(data);
+	if (!IS_ERR(data)) {
+		error = aa_replace_profiles(ns, label, mask, data);
+		aa_put_profile_loaddata(data);
+	}
+
+	end_current_label_crit_section(label);
+
+	return error >= 0 ? 0 : error;
+}
+
+/**
+ * aa_profile_load_ns_name - load a profile into a namespace identified by name
+ * @allow_replace: allow replacing profiles
+ * @name: The name of the namespace to load the policy in, relative to the
+ *        caller's current namespace. "" or NULL for the caller's current
+ *        namespace.
+ * @name_size: size of @name. 0 for the caller's current namespace.
+ * @buf: buffer containing the user-provided policy
+ * @size: size of @buf
+ * @ppos: position pointer in the file
+ *
+ * Returns: 0 on success, negative value on error
+ */
+ssize_t aa_profile_load_ns_name(bool allow_replace, char *name, size_t name_size,
+				const void __user *buf, size_t size,
+				loff_t *ppos)
+{
+	struct aa_ns *current_ns = aa_get_current_ns();
+	struct aa_ns *ns;
+	ssize_t error;
+
+	if (name_size == 0)
+		ns = aa_get_ns(current_ns);
+	else
+		ns = aa_lookupn_ns(current_ns, name, name_size);
+
+	aa_put_ns(current_ns);
+
+	if (!ns)
+		return -EINVAL;
+
+	error = aa_profile_load_into_ns(allow_replace, ns, buf, size, ppos);
+
+	aa_put_ns(ns);
 
 	return error;
 }
@@ -568,7 +684,7 @@ static ssize_t profile_remove(struct file *f, const char __user *buf,
 	 * aa_remove_profile needs a null terminated string so 1 extra
 	 * byte is allocated and the copied data is null terminated.
 	 */
-	data = aa_simple_write_to_buffer(buf, size + 1, size, pos);
+	data = aa_simple_write_to_buffer(buf, size + 1, size, pos, GFP_KERNEL);
 
 	error = PTR_ERR(data);
 	if (!IS_ERR(data)) {

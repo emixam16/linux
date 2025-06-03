@@ -342,6 +342,48 @@ void __aa_remove_ns(struct aa_ns *ns)
 }
 
 /**
+ * aa_self_policy_ns_put - drop a task-ref on a transient self_policy ns
+ * @ns: transient namespace to release reference on (MAY BE NULL)
+ *
+ * Counterpart to aa_self_policy_ns_get(). Decrements both the
+ * self_policy task counter and the namespace refcount. When the last
+ * task ctx references this namespace, the namespace is removed from
+ * its parent's sub_ns list (if it is still there) so that the list
+ * reference is dropped and the namespace can be freed.
+ *
+ */
+void aa_self_policy_ns_put(struct aa_ns *ns)
+{
+	struct aa_ns *parent;
+	struct aa_ns *sib;
+	bool on_list = false;
+
+	if (!ns)
+		return;
+
+	if (!atomic_dec_and_test(&ns->self_policy_task_refs)) {
+		aa_put_ns(ns);
+		return;
+	}
+
+	parent = ns->parent;
+	if (parent) {
+		mutex_lock_nested(&parent->lock, parent->level);
+		list_for_each_entry(sib, &parent->sub_ns, base.list) {
+			if (sib == ns) {
+				on_list = true;
+				break;
+			}
+		}
+		if (on_list)
+			__aa_remove_ns(ns);
+		mutex_unlock(&parent->lock);
+	}
+
+	aa_put_ns(ns);
+}
+
+/**
  * __ns_list_release - remove all profile namespaces on the list put refs
  * @head: list of profile namespaces  (NOT NULL)
  *

@@ -167,7 +167,7 @@ void __aa_loaddata_update(struct aa_loaddata *data, long revision);
 bool aa_rawdata_eq(struct aa_loaddata *l, struct aa_loaddata *r);
 void aa_loaddata_kref(struct kref *kref);
 void aa_ploaddata_kref(struct kref *kref);
-struct aa_loaddata *aa_loaddata_alloc(size_t size);
+struct aa_loaddata *aa_loaddata_alloc(size_t size, gfp_t flags);
 static inline void aa_put_i_loaddata(struct aa_loaddata *data)
 {
 	if (data)

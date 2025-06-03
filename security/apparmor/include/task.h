@@ -20,12 +20,15 @@ static inline struct aa_task_ctx *task_ctx(struct task_struct *task)
  * @nnp: snapshot of label at time of no_new_privs
  * @onexec: profile to transition to on next exec  (MAY BE NULL)
  * @previous: profile the task may return to     (MAY BE NULL)
+ * @self_policy_ns: transient namespace used as a load target for
+ * lsm_config_policy() with LSM_CONFIG_SELF.	(MAY BE NULL)
  * @token: magic value the task must know for returning to @previous_profile
  */
 struct aa_task_ctx {
 	struct aa_label *nnp;
 	struct aa_label *onexec;
 	struct aa_label *previous;
+	struct aa_ns *self_policy_ns;
 	u64 token;
 };
 
@@ -45,6 +48,7 @@ static inline void aa_free_task_ctx(struct aa_task_ctx *ctx)
 		aa_put_label(ctx->nnp);
 		aa_put_label(ctx->previous);
 		aa_put_label(ctx->onexec);
+		aa_self_policy_ns_put(ctx->self_policy_ns);
 	}
 }
 
@@ -60,6 +64,7 @@ static inline void aa_dup_task_ctx(struct aa_task_ctx *new,
 	aa_get_label(new->nnp);
 	aa_get_label(new->previous);
 	aa_get_label(new->onexec);
+	aa_self_policy_ns_get(new->self_policy_ns);
 }
 
 /**

@@ -114,6 +114,16 @@ int __aafs_profile_mkdir(struct aa_profile *profile, struct dentry *parent);
 void __aafs_ns_rmdir(struct aa_ns *ns);
 int __aafs_ns_mkdir(struct aa_ns *ns, struct dentry *parent, const char *name,
 		     struct dentry *dent);
+ssize_t aa_profile_load_into_ns(bool allow_replace, struct aa_ns *ns,
+				const void __user *buf, size_t size,
+				loff_t *ppos);
+ssize_t aa_profile_load_self(bool allow_replace, struct aa_ns *ns,
+			     const void __user *buf, size_t size,
+			     loff_t *ppos);
+ssize_t aa_profile_load_ns_name(bool allow_replace, char *name, size_t name_len,
+				const void __user *buf, size_t size,
+				loff_t *ppos);
+
 
 struct aa_loaddata;
 
