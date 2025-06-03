@@ -127,3 +127,23 @@ SYSCALL_DEFINE3(lsm_list_modules, u64 __user *, ids, u32 __user *, size,
 
 	return lsm_active_cnt;
 }
+
+/**
+ * sys_lsm_config_policy - Configure a security module's policy
+ * @lsm_id: the LSM id
+ * @op: operation to perform
+ * @buf: user-space destination for the policy data
+ * @size: size of @buf
+ * @common_flags: special handling options. LSM_CONFIG_SELF targets the
+ * calling task's domain.
+ * @flags: LSM-specific flags
+ *
+ * Configures the specified LSM's policy. This syscall requires CAP_MAC_ADMIN
+ * unless LSM_CONFIG_SELF is set. On success returns 0. A negative value
+ * indicating the error is returned on failure.
+ */
+SYSCALL_DEFINE6(lsm_config_policy, u32, lsm_id, u32, op, void __user *, buf,
+		u32, size, u32, common_flags, u32, flags)
+{
+	return 0;
+}

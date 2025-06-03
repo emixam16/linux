@@ -862,9 +862,11 @@ __SYSCALL(__NR_listns, sys_listns)
 
 #define __NR_rseq_slice_yield 471
 __SYSCALL(__NR_rseq_slice_yield, sys_rseq_slice_yield)
+#define __NR_lsm_config_policy 472
+__SYSCALL(__NR_lsm_config_policy, sys_lsm_config_policy)
 
 #undef __NR_syscalls
-#define __NR_syscalls 472
+#define __NR_syscalls 473
 
 /*
  * 32 bit systems traditionally used different
