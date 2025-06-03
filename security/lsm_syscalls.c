@@ -136,5 +136,14 @@ SYSCALL_DEFINE3(lsm_list_modules, u64 __user *, ids, u32 __user *, size,
 SYSCALL_DEFINE6(lsm_config_policy, u32, lsm_id, u32, op, void __user *, buf,
 		u32, size, u32, common_flags, u32, flags)
 {
-	return 0;
+	if (common_flags & ~LSM_CONFIG_SELF)
+		return -EINVAL;
+	if (common_flags & LSM_CONFIG_SELF)
+		return security_lsm_config_self_policy(lsm_id, op, buf, size,
+						       flags);
+
+	if (!capable(CAP_MAC_ADMIN))
+		return -EPERM;
+
+	return security_lsm_config_system_policy(lsm_id, op, buf, size, flags);
 }
