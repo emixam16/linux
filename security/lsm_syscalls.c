@@ -130,20 +130,63 @@ SYSCALL_DEFINE3(lsm_list_modules, u64 __user *, ids, u32 __user *, size,
 
 /**
  * sys_lsm_config_policy - Configure a security module's policy
- * @lsm_id: the LSM id
- * @op: operation to perform
- * @buf: user-space destination for the policy data
- * @size: size of @buf
- * @common_flags: special handling options. LSM_CONFIG_SELF targets the
- * calling task's domain.
- * @flags: LSM-specific flags
+ * @lsm_id: identifier of the target LSM (one of LSM_ID_*)
+ * @op: operation to perform on the policy. Defined operations:
  *
- * Configures the specified LSM's policy. This syscall requires CAP_MAC_ADMIN
- * unless LSM_CONFIG_SELF is set. On success returns 0. A negative value
- * indicating the error is returned on failure.
+ *	* %LSM_POLICY_LOAD - load a new policy fragment
+ *
+ *	Operations not supported by the targeted LSM return -EOPNOTSUPP.
+ * @buf: user-space pointer to the policy payload. The exact layout is
+ *	LSM-specific; refer to the per-LSM admin-guide documentation.
+ * @size: size of @buf in bytes
+ * @common_flags: handling instructions common to all LSMs. Currently one
+ *	flag is defined:
+ *
+ *	* %LSM_CONFIG_SELF - the configuration applies to the calling
+ *	  task's own domain (where the targeted LSM supports it) rather
+ *	  than to the system-wide policy. The semantics of "self" vary
+ *	  per LSM and are described in the per-LSM admin guide.
+ *
+ *	Setting any reserved bit in @common_flags returns -EINVAL.
+ * @flags: LSM-specific flags. Currently reserved; must be zero. Non-zero
+ *	values cause the targeted LSM hook to return -EOPNOTSUPP.
+ *
+ * Configures the targeted LSM's policy without going through that LSM's
+ * pseudo-filesystem, so the call also works in environments where the
+ * LSM filesystem is unavailable (e.g. inside a container).
+ *
+ * Without LSM_CONFIG_SELF the call requires CAP_MAC_ADMIN in the
+ * initial user namespace.
+ *
+ * With LSM_CONFIG_SELF the capability requirement is delegated to the
+ * targeted LSM: some LSMs (AppArmor) permit unprivileged self-policy
+ * loads because the load is monotonically restrictive and can only
+ * further confine the caller; other LSMs (Smack) still require
+ * CAP_MAC_ADMIN. See the per-LSM admin guide for details.
+ *
+ * Return: 0 on success. On failure, returns a negative errno. Common
+ * errors:
+ *
+ *	* %-EOPNOTSUPP - @lsm_id is not registered, the LSM does not
+ *	  implement the requested @op, or @flags is non-zero
+ *	* %-EINVAL - reserved bits set in @common_flags, or LSM-specific
+ *	  payload validation failed
+ *	* %-EPERM - CAP_MAC_ADMIN required but not held
+ *	* %-E2BIG - @size exceeds the targeted LSM's payload limit
+ *	* %-EACCES - the targeted LSM disallowed the operation (e.g.
+ *	  AppArmor with apparmor.lock_policy=Y)
  */
 SYSCALL_DEFINE6(lsm_config_policy, u32, lsm_id, u32, op, void __user *, buf,
 		u32, size, u32, common_flags, u32, flags)
 {
-	return 0;
+	if (common_flags & ~LSM_CONFIG_SELF)
+		return -EINVAL;
+	if (common_flags & LSM_CONFIG_SELF)
+		return security_lsm_config_self_policy(lsm_id, op, buf, size,
+						       flags);
+
+	if (!capable(CAP_MAC_ADMIN))
+		return -EPERM;
+
+	return security_lsm_config_system_policy(lsm_id, op, buf, size, flags);
 }
