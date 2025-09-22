@@ -420,9 +420,6 @@ static ssize_t smk_parse_long_rule(char *data, struct smack_parsed_rule *rule,
 	return rc == 0 ? cnt : rc;
 }
 
-#define SMK_FIXED24_FMT	0	/* Fixed 24byte label format */
-#define SMK_LONG_FMT	1	/* Variable long label format */
-#define SMK_CHANGE_FMT	2	/* Rule modification format */
 /**
  * smk_write_rules_list - write() for any /smack rule file
  * @file: file pointer, not actually used
@@ -442,7 +439,7 @@ static ssize_t smk_parse_long_rule(char *data, struct smack_parsed_rule *rule,
  *	"subject<whitespace>object<whitespace>
  *	 acc_enable<whitespace>acc_disable[<whitespace>...]"
  */
-static ssize_t smk_write_rules_list(struct file *file, const char __user *buf,
+ssize_t smk_write_rules_list(struct file *file, const char __user *buf,
 					size_t count, loff_t *ppos,
 					struct list_head *rule_list,
 					struct mutex *rule_lock, int format)
