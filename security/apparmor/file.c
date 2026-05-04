@@ -189,7 +189,22 @@ aa_state_t aa_str_perms(struct aa_policydb *file_rules, aa_state_t start,
 			struct aa_perms *perms)
 {
 	aa_state_t state;
-	state = aa_dfa_match(file_rules->dfa, start, name);
+	bool is_file_start = (start == file_rules->start[AA_CLASS_FILE]);
+	u32 *dense2 = is_file_start ? file_rules->dense2_start_file : NULL;
+	u32 *dense  = is_file_start ? file_rules->dense_start[AA_CLASS_FILE]
+				    : NULL;
+
+	if (dense2 && name[0] && name[1]) {
+		state = dense2[((u8)name[0] << 8) | (u8)name[1]];
+		prefetch(&file_rules->dfa->base[state]);
+		state = aa_dfa_match(file_rules->dfa, state, name + 2);
+	} else if (dense && name[0]) {
+		state = dense[(u8)name[0]];
+		prefetch(&file_rules->dfa->base[state]);
+		state = aa_dfa_match(file_rules->dfa, state, name + 1);
+	} else {
+		state = aa_dfa_match(file_rules->dfa, start, name);
+	}
 	*perms = *(aa_lookup_condperms(current_fsuid(), file_rules, state,
 				       cond));
 

@@ -122,6 +122,10 @@ struct aa_policydb {
 	struct aa_str_table trans;
 	struct aa_tags_struct tags;
 	aa_state_t start[AA_CLASS_LAST + 1];
+	/* per-class first-byte transition table; ~1 KiB per non-zero start */
+	u32 *dense_start[AA_CLASS_LAST + 1];
+	/* 2-byte transition table for AA_CLASS_FILE; 256 KiB per pdb */
+	u32 *dense2_start_file;
 };
 
 extern struct aa_policydb *nullpdb;
@@ -130,6 +134,7 @@ void aa_destroy_tags(struct aa_tags_struct *tags);
 struct aa_policydb *aa_alloc_pdb(gfp_t gfp);
 void aa_pdb_free_kref(struct kref *kref);
 void aa_pdb_fold_accept_flags(struct aa_policydb *pdb);
+void aa_pdb_build_dense_starts(struct aa_policydb *pdb);
 
 /**
  * aa_get_pdb - increment refcount on @pdb

@@ -1075,6 +1075,12 @@ static int unpack_pdb(struct aa_ext *e, struct aa_policydb **policy,
 	if (!pdb->dfa && pdb->trans.table)
 		aa_destroy_str_table(&pdb->trans);
 
+	/* fold/dense build runs here; fold runs again post-compat in
+	 * unpack_profile() after aa_compat_map_*() may rewrite ACCEPT2.
+	 */
+	if (pdb->dfa)
+		aa_pdb_build_dense_starts(pdb);
+
 	/* TODO:
 	 * - move compat mapping here, requires dfa merging first
 	 * - move verify here, it has to be done after compat mappings

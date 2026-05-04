@@ -109,10 +109,15 @@ void aa_destroy_tags(struct aa_tags_struct *tags)
 static void aa_free_pdb(struct aa_policydb *pdb)
 {
 	if (pdb) {
+		int i;
+
 		aa_put_dfa(pdb->dfa);
 		kvfree(pdb->perms);
 		aa_destroy_str_table(&pdb->trans);
 		aa_destroy_tags(&pdb->tags);
+		for (i = 0; i <= AA_CLASS_LAST; i++)
+			kfree(pdb->dense_start[i]);
+		kvfree(pdb->dense2_start_file);
 		kfree(pdb);
 	}
 }
@@ -146,6 +151,58 @@ void aa_pdb_fold_accept_flags(struct aa_policydb *pdb)
 			accept[i] |= AA_ACCEPT_OWNER_FOLDED;
 		else
 			accept[i] &= ~AA_ACCEPT_OWNER_FOLDED;
+	}
+}
+
+/*
+ * Precompute per-class first-byte (and 2-byte for AA_CLASS_FILE)
+ * transition tables so aa_str_perms can skip the first match steps.
+ * Allocation failures fall back silently to the slow path.
+ */
+void aa_pdb_build_dense_starts(struct aa_policydb *pdb)
+{
+	int c, b;
+
+	if (!pdb || !pdb->dfa)
+		return;
+	for (c = 0; c <= AA_CLASS_LAST; c++) {
+		aa_state_t s = pdb->start[c];
+		u32 *tbl;
+
+		if (pdb->dense_start[c] || s == DFA_NOMATCH)
+			continue;
+		tbl = kmalloc_array(256, sizeof(u32), GFP_KERNEL);
+		if (!tbl)
+			continue;
+		for (b = 0; b < 256; b++) {
+			u8 ec = pdb->dfa->equiv ? pdb->dfa->equiv[b]
+						: (u8)b;
+			tbl[b] = __aa_dfa_step(pdb->dfa, s, ec);
+		}
+		pdb->dense_start[c] = tbl;
+	}
+
+	/* 2-byte table for AA_CLASS_FILE: 256 KiB, built atop d1 above */
+	if (pdb->dense_start[AA_CLASS_FILE] && !pdb->dense2_start_file) {
+		u32 *d1 = pdb->dense_start[AA_CLASS_FILE];
+		u32 *d2 = kvmalloc_array(256u * 256u, sizeof(u32),
+					 GFP_KERNEL);
+		int b0, b1;
+
+		if (d2) {
+			for (b0 = 0; b0 < 256; b0++) {
+				aa_state_t s1 = d1[b0];
+
+				for (b1 = 0; b1 < 256; b1++) {
+					u8 ec = pdb->dfa->equiv
+						? pdb->dfa->equiv[b1]
+						: (u8)b1;
+					d2[b0 * 256 + b1] =
+						__aa_dfa_step(pdb->dfa, s1, ec);
+				}
+			}
+			pdb->dense2_start_file = d2;
+		}
 	}
 }
 
