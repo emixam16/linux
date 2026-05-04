@@ -142,11 +142,14 @@ void aa_pdb_build_dense_starts(struct aa_policydb *pdb);
  *
  * Returns: pointer to @pdb if @pdb is NULL will return NULL
  * Requires: @pdb must be held with valid refcount when called
+ *
+ * @nullpdb has system lifetime; skip the atomic to avoid cacheline
+ * ping-pong on unconfined profile create/destroy.
  */
 static inline struct aa_policydb *aa_get_pdb(struct aa_policydb *pdb)
 {
-	if (pdb)
-		kref_get(&(pdb->count));
+	if (pdb && pdb != nullpdb)
+		kref_get(&pdb->count);
 
 	return pdb;
 }
@@ -156,10 +159,13 @@ static inline struct aa_policydb *aa_get_pdb(struct aa_policydb *pdb)
  * @pdb: pdb to put refcount   (MAYBE NULL)
  *
  * Requires: if @pdb != NULL that a valid refcount be held
+ *
+ * Skips @nullpdb (see aa_get_pdb); aa_teardown_dfa_engine() does the
+ * final put via kref_put() directly.
  */
 static inline void aa_put_pdb(struct aa_policydb *pdb)
 {
-	if (pdb)
+	if (pdb && pdb != nullpdb)
 		kref_put(&pdb->count, aa_pdb_free_kref);
 }
 

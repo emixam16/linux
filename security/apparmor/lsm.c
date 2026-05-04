@@ -2477,7 +2477,9 @@ static int __init aa_setup_dfa_engine(void)
 	return 0;
 
 fail:
-	aa_put_pdb(nullpdb);
+	/* aa_put_pdb() short-circuits on nullpdb; drop the ref directly */
+	if (nullpdb)
+		kref_put(&nullpdb->count, aa_pdb_free_kref);
 	aa_put_dfa(nulldfa);
 	nullpdb = NULL;
 	nulldfa = NULL;
@@ -2490,7 +2492,8 @@ static void __init aa_teardown_dfa_engine(void)
 {
 	aa_put_dfa(stacksplitdfa);
 	aa_put_dfa(nulldfa);
-	aa_put_pdb(nullpdb);
+	if (nullpdb)
+		kref_put(&nullpdb->count, aa_pdb_free_kref);
 	nullpdb = NULL;
 	stacksplitdfa = NULL;
 	nulldfa = NULL;
