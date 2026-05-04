@@ -226,6 +226,13 @@ int __aa_path_perm(const char *op, const struct cred *subj_cred,
 		     name, cond, perms);
 	if (request & ~perms->allow)
 		e = -EACCES;
+
+	/* fast path: aa_audit_file() would no-op for an allowed request */
+	if (likely(!e) &&
+	    likely(!(request & (perms->audit | perms->kill | perms->quiet))) &&
+	    likely(AUDIT_MODE(profile) != AUDIT_ALL))
+		return 0;
+
 	return aa_audit_file(subj_cred,
 			     profile, perms, op, request, name, NULL, NULL,
 			     cond->uid, NULL, e);
@@ -270,7 +277,8 @@ int aa_path_perm(const char *op, const struct cred *subj_cred,
 		 const struct path *path, int flags, u32 request,
 		 struct path_cond *cond)
 {
-	struct aa_perms perms = {};
+	/* overwritten by aa_str_perms() before any field is read */
+	struct aa_perms perms;
 	struct aa_profile *profile;
 	char *buffer = NULL;
 	int error;
