@@ -12,6 +12,9 @@ apparmor-$(CONFIG_SECURITY_APPARMOR_HASH) += crypto.o
 obj-$(CONFIG_SECURITY_APPARMOR_KUNIT_TEST) += apparmor_policy_unpack_test.o
 apparmor_policy_unpack_test-objs += policy_unpack_test.o
 
+obj-$(CONFIG_SECURITY_APPARMOR_KUNIT_TEST) += apparmor_match_test.o
+apparmor_match_test-objs += match_test.o
+
 clean-files := capability_names.h rlim_names.h net_names.h
 
 # Build a lower case string table of address family names
