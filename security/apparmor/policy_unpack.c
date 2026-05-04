@@ -1058,6 +1058,8 @@ static int unpack_pdb(struct aa_ext *e, struct aa_policydb **policy,
 		}
 		pdb->dfa->tables[YYTD_ID_ACCEPT2]->td_lolen = noents;
 		pdb->dfa->tables[YYTD_ID_ACCEPT2]->td_flags = tdflags;
+		/* refresh cached hot pointers now that ACCEPT2 exists */
+		aa_dfa_resolve_tables(pdb->dfa);
 	}
 	/*
 	 * Unfortunately due to a bug in earlier userspaces, a
@@ -1303,12 +1305,13 @@ static struct aa_profile *unpack_profile(struct aa_ext *e, char **ns_name)
 		if (error)
 			goto fail;
 		/* Fixup: drop when we get rid of start array */
-		if (aa_dfa_next(rules->policy->dfa, rules->policy->start[0],
-				AA_CLASS_FILE))
-			rules->policy->start[AA_CLASS_FILE] =
-			  aa_dfa_next(rules->policy->dfa,
-				      rules->policy->start[0],
-				      AA_CLASS_FILE);
+		{
+			aa_state_t s = aa_dfa_next(rules->policy->dfa,
+						   rules->policy->start[0],
+						   AA_CLASS_FILE);
+			if (s)
+				rules->policy->start[AA_CLASS_FILE] = s;
+		}
 		if (!aa_unpack_nameX(e, AA_STRUCTEND, NULL))
 			goto fail;
 		if (!rules->policy->perms) {

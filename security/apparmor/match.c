@@ -22,6 +22,27 @@
 
 #define base_idx(X) ((X) & 0xffffff)
 
+/* Cache @dfa->{base,..,equiv} from @dfa->tables[] for the matcher. */
+void aa_dfa_resolve_tables(struct aa_dfa *dfa)
+{
+	struct table_header *t;
+
+	t = dfa->tables[YYTD_ID_BASE];
+	dfa->base = t ? TABLE_DATAU32(t) : NULL;
+	t = dfa->tables[YYTD_ID_DEF];
+	dfa->def = t ? TABLE_DATAU32(t) : NULL;
+	t = dfa->tables[YYTD_ID_NXT];
+	dfa->next = t ? TABLE_DATAU32(t) : NULL;
+	t = dfa->tables[YYTD_ID_CHK];
+	dfa->check = t ? TABLE_DATAU32(t) : NULL;
+	t = dfa->tables[YYTD_ID_ACCEPT];
+	dfa->accept = t ? TABLE_DATAU32(t) : NULL;
+	t = dfa->tables[YYTD_ID_ACCEPT2];
+	dfa->accept2 = t ? TABLE_DATAU32(t) : NULL;
+	t = dfa->tables[YYTD_ID_EC];
+	dfa->equiv = t ? (u8 *)t->td_data : NULL;
+}
+
 /**
  * unpack_table - unpack a dfa table (one of accept, default, base, next check)
  * @blob: data to unpack (NOT NULL)
@@ -419,6 +440,8 @@ struct aa_dfa *aa_dfa_unpack(void *blob, size_t size, int flags)
 	if (error)
 		goto fail;
 
+	aa_dfa_resolve_tables(dfa);
+
 	if (flags & DFA_FLAG_VERIFY_STATES) {
 		error = verify_dfa(dfa);
 		if (error)
@@ -553,20 +576,7 @@ aa_state_t aa_dfa_match(struct aa_dfa *dfa, aa_state_t start, const char *str)
  */
 aa_state_t aa_dfa_next(struct aa_dfa *dfa, aa_state_t state, const char c)
 {
-	u32 *def = DEFAULT_TABLE(dfa);
-	u32 *base = BASE_TABLE(dfa);
-	u32 *next = NEXT_TABLE(dfa);
-	u32 *check = CHECK_TABLE(dfa);
-
-	/* current state is <state>, matching character *str */
-	if (dfa->tables[YYTD_ID_EC]) {
-		/* Equivalence class table defined */
-		u8 *equiv = EQUIV_TABLE(dfa);
-		match_char(state, def, base, next, check, equiv[(u8) c]);
-	} else
-		match_char(state, def, base, next, check, (u8) c);
-
-	return state;
+	return __aa_dfa_step_byte(dfa, state, (u8)c);
 }
 
 aa_state_t aa_dfa_outofband_transition(struct aa_dfa *dfa, aa_state_t state)

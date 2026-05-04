@@ -89,20 +89,38 @@ struct table_header {
 
 #define TABLE_DATAU16(TABLE) ((u16 *)((TABLE)->td_data))
 #define TABLE_DATAU32(TABLE) ((u32 *)((TABLE)->td_data))
-#define DEFAULT_TABLE(DFA) ((u32 *)((DFA)->tables[YYTD_ID_DEF]->td_data))
-#define BASE_TABLE(DFA) ((u32 *)((DFA)->tables[YYTD_ID_BASE]->td_data))
-#define NEXT_TABLE(DFA) ((u32 *)((DFA)->tables[YYTD_ID_NXT]->td_data))
-#define CHECK_TABLE(DFA) ((u32 *)((DFA)->tables[YYTD_ID_CHK]->td_data))
-#define EQUIV_TABLE(DFA) ((u8 *)((DFA)->tables[YYTD_ID_EC]->td_data))
-#define ACCEPT_TABLE(DFA) ((u32 *)((DFA)->tables[YYTD_ID_ACCEPT]->td_data))
-#define ACCEPT_TABLE2(DFA) ((u32 *)((DFA)->tables[YYTD_ID_ACCEPT2]->td_data))
 
+/*
+ * Hot pointers (@base..@equiv) are cached from @tables[] by
+ * aa_dfa_resolve_tables() so the matcher avoids a pointer chase per step.
+ */
 struct aa_dfa {
-	struct kref count;
-	u16 flags;
+	u32 *base;
+	u32 *def;
+	u32 *next;
+	u32 *check;
+	u32 *accept;
+	u32 *accept2;	/* may be NULL */
+	u8 *equiv;	/* may be NULL */
 	u32 max_oob;
+	u16 flags;
+
+	struct kref count;
 	struct table_header *tables[YYTD_ID_TSIZE];
 };
+
+#define DEFAULT_TABLE(DFA) ((DFA)->def)
+#define BASE_TABLE(DFA) ((DFA)->base)
+#define NEXT_TABLE(DFA) ((DFA)->next)
+#define CHECK_TABLE(DFA) ((DFA)->check)
+#define EQUIV_TABLE(DFA) ((DFA)->equiv)
+#define ACCEPT_TABLE(DFA) ((DFA)->accept)
+#define ACCEPT_TABLE2(DFA) ((DFA)->accept2)
+
+/* Refresh @dfa->{base,def,...} from @dfa->tables[]. Call after any
+ * mutation of @tables[]; the matcher reads the cached pointers.
+ */
+void aa_dfa_resolve_tables(struct aa_dfa *dfa);
 
 #define UNPACK_ARRAY(TABLE, BLOB, LEN, TTYPE, BTYPE, NTOHX)	\
 	do { \
@@ -125,6 +143,14 @@ static inline size_t table_size(size_t len, size_t el_size)
 
 #define aa_state_t unsigned int
 
+#define MATCH_FLAG_DIFF_ENCODE 0x80000000
+#define MARK_DIFF_ENCODE 0x40000000
+#define MATCH_FLAG_OOB_TRANSITION 0x20000000
+#define MARK_DIFF_ENCODE_VERIFIED 0x10000000
+#define MATCH_FLAGS_MASK 0xff000000
+#define MATCH_FLAGS_VALID (MATCH_FLAG_DIFF_ENCODE | MATCH_FLAG_OOB_TRANSITION)
+#define MATCH_FLAGS_INVALID (MATCH_FLAGS_MASK & ~MATCH_FLAGS_VALID)
+
 struct aa_dfa *aa_dfa_unpack(void *blob, size_t size, int flags);
 aa_state_t aa_dfa_match_len(struct aa_dfa *dfa, aa_state_t start,
 			    const char *str, int len);
@@ -132,6 +158,41 @@ aa_state_t aa_dfa_match(struct aa_dfa *dfa, aa_state_t start,
 			const char *str);
 aa_state_t aa_dfa_next(struct aa_dfa *dfa, aa_state_t state, const char c);
 aa_state_t aa_dfa_outofband_transition(struct aa_dfa *dfa, aa_state_t state);
+
+/* Single-step the DFA on the (already EC-mapped) byte @c. */
+static __always_inline aa_state_t
+__aa_dfa_step(const struct aa_dfa *dfa, aa_state_t state, u8 c)
+{
+	const u32 *base  = dfa->base;
+	const u32 *def   = dfa->def;
+	const u32 *next  = dfa->next;
+	const u32 *check = dfa->check;
+
+	do {
+		u32 b = base[state];
+		unsigned int pos = (b & 0xffffffu) + c;
+
+		if (likely(check[pos] == state)) {
+			state = next[pos];
+			break;
+		}
+		state = def[state];
+		if (unlikely(b & MATCH_FLAG_DIFF_ENCODE))
+			continue;
+		break;
+	} while (1);
+
+	return state;
+}
+
+/* Step one byte through @dfa, applying the EC table if present. */
+static __always_inline aa_state_t
+__aa_dfa_step_byte(const struct aa_dfa *dfa, aa_state_t state, u8 c)
+{
+	if (dfa->equiv)
+		c = dfa->equiv[c];
+	return __aa_dfa_step(dfa, state, c);
+}
 aa_state_t aa_dfa_match_until(struct aa_dfa *dfa, aa_state_t start,
 			      const char *str, const char **retpos);
 aa_state_t aa_dfa_matchn_until(struct aa_dfa *dfa, aa_state_t start,
@@ -181,13 +242,5 @@ static inline void aa_put_dfa(struct aa_dfa *dfa)
 	if (dfa)
 		kref_put(&dfa->count, aa_dfa_free_kref);
 }
-
-#define MATCH_FLAG_DIFF_ENCODE 0x80000000
-#define MARK_DIFF_ENCODE 0x40000000
-#define MATCH_FLAG_OOB_TRANSITION 0x20000000
-#define MARK_DIFF_ENCODE_VERIFIED 0x10000000
-#define MATCH_FLAGS_MASK 0xff000000
-#define MATCH_FLAGS_VALID (MATCH_FLAG_DIFF_ENCODE | MATCH_FLAG_OOB_TRANSITION)
-#define MATCH_FLAGS_INVALID (MATCH_FLAGS_MASK & ~MATCH_FLAGS_VALID)
 
 #endif /* __AA_MATCH_H */
