@@ -77,9 +77,9 @@ int aa_audit_file(const struct cred *cred,
 		  const char *target, struct aa_label *tlabel, kuid_t ouid,
 		  const char *info, int error);
 
-struct aa_perms *aa_lookup_condperms(kuid_t subj_uid,
-				     struct aa_policydb *file_rules,
-				     aa_state_t state, struct path_cond *cond);
+/* aa_lookup_condperms() is static __always_inline in policy.h */
+extern struct aa_perms default_perms;
+
 aa_state_t aa_str_perms(struct aa_policydb *file_rules, aa_state_t start,
 			const char *name, struct path_cond *cond,
 			struct aa_perms *perms);

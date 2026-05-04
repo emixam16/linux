@@ -173,33 +173,6 @@ static int path_name(const char *op, const struct cred *subj_cred,
 }
 
 struct aa_perms default_perms = {};
-/**
- * aa_lookup_condperms - convert dfa compressed perms to internal perms
- * @subj_uid: uid to use for subject owner test
- * @rules: the aa_policydb to lookup perms for  (NOT NULL)
- * @state: state in dfa
- * @cond:  conditions to consider  (NOT NULL)
- *
- * TODO: convert from dfa + state to permission entry
- *
- * Returns: a pointer to a file permission set
- */
-struct aa_perms *aa_lookup_condperms(kuid_t subj_uid, struct aa_policydb *rules,
-				     aa_state_t state, struct path_cond *cond)
-{
-	unsigned int index = ACCEPT_TABLE(rules->dfa)[state];
-
-	if (!(rules->perms))
-		return &default_perms;
-
-	if ((ACCEPT_TABLE2(rules->dfa)[state] & ACCEPT_FLAG_OWNER)) {
-		if (uid_eq(subj_uid, cond->uid))
-			return &(rules->perms[index]);
-		return &(rules->perms[index + 1]);
-	}
-
-	return &(rules->perms[index]);
-}
 
 /**
  * aa_str_perms - find permission that match @name

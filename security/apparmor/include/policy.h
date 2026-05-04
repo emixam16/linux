@@ -64,6 +64,10 @@ enum dfa_accept_flags {
 	ACCEPT_FLAG_OWNER = 1,
 };
 
+/* OWNER bit folded into ACCEPT[state] high bit; index in low 31. */
+#define AA_ACCEPT_OWNER_FOLDED		0x80000000u
+#define AA_ACCEPT_INDEX_MASK		0x7fffffffu
+
 /*
  * FIXME: currently need a clean way to replace and remove profiles as a
  * set.  It should be done at the namespace level.
@@ -125,6 +129,7 @@ extern struct aa_policydb *nullpdb;
 void aa_destroy_tags(struct aa_tags_struct *tags);
 struct aa_policydb *aa_alloc_pdb(gfp_t gfp);
 void aa_pdb_free_kref(struct kref *kref);
+void aa_pdb_fold_accept_flags(struct aa_policydb *pdb);
 
 /**
  * aa_get_pdb - increment refcount on @pdb
@@ -157,12 +162,32 @@ static inline void aa_put_pdb(struct aa_policydb *pdb)
 static inline struct aa_perms *aa_lookup_perms(struct aa_policydb *policy,
 					       aa_state_t state)
 {
-	unsigned int index = ACCEPT_TABLE(policy->dfa)[state];
+	unsigned int index = ACCEPT_TABLE(policy->dfa)[state]
+			     & AA_ACCEPT_INDEX_MASK;
 
 	if (!(policy->perms))
 		return &default_perms;
 
 	return &(policy->perms[index]);
+}
+
+/* file mediation hot path: ACCEPT[state] holds index|OWNER post-fold */
+static __always_inline struct aa_perms *
+aa_lookup_condperms(kuid_t subj_uid, struct aa_policydb *file_rules,
+		    aa_state_t state, struct path_cond *cond)
+{
+	u32 word = file_rules->dfa->accept[state];
+	unsigned int index = word & AA_ACCEPT_INDEX_MASK;
+
+	if (!file_rules->perms)
+		return &default_perms;
+
+	if (word & AA_ACCEPT_OWNER_FOLDED) {
+		if (uid_eq(subj_uid, cond->uid))
+			return &file_rules->perms[index];
+		return &file_rules->perms[index + 1];
+	}
+	return &file_rules->perms[index];
 }
 
 /* struct aa_data - generic data structure

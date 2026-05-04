@@ -117,6 +117,38 @@ static void aa_free_pdb(struct aa_policydb *pdb)
 	}
 }
 
+/*
+ * Fold ACCEPT2[state]&ACCEPT_FLAG_OWNER into ACCEPT[state] high bit
+ * so the hot path skips the ACCEPT2 cacheline. Idempotent; call after
+ * any mutation of ACCEPT2 (e.g. aa_compat_map_*).
+ */
+void aa_pdb_fold_accept_flags(struct aa_policydb *pdb)
+{
+	struct aa_dfa *dfa;
+	struct table_header *t;
+	u32 *accept;
+	const u32 *accept2;
+	size_t i, n;
+
+	if (!pdb || !pdb->dfa)
+		return;
+	dfa = pdb->dfa;
+	if (!dfa->accept || !dfa->accept2)
+		return;
+	t = dfa->tables[YYTD_ID_ACCEPT];
+	if (!t)
+		return;
+	n = t->td_lolen;
+	accept = dfa->accept;
+	accept2 = dfa->accept2;
+	for (i = 0; i < n; i++) {
+		if (accept2[i] & ACCEPT_FLAG_OWNER)
+			accept[i] |= AA_ACCEPT_OWNER_FOLDED;
+		else
+			accept[i] &= ~AA_ACCEPT_OWNER_FOLDED;
+	}
+}
+
 /**
  * aa_pdb_free_kref - free aa_policydb by kref (called by aa_put_pdb)
  * @kref: kref callback for freeing of a dfa  (NOT NULL)

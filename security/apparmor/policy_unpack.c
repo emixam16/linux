@@ -1187,6 +1187,7 @@ static struct aa_profile *unpack_profile(struct aa_ext *e, char **ns_name)
 				info = "failed to convert xmatch permission table";
 				goto fail;
 			}
+			aa_pdb_fold_accept_flags(profile->attach.xmatch);
 		}
 	}
 
@@ -1322,6 +1323,7 @@ static struct aa_profile *unpack_profile(struct aa_ext *e, char **ns_name)
 				goto fail;
 			}
 		}
+		aa_pdb_fold_accept_flags(rules->policy);
 	} else {
 		rules->policy = aa_get_pdb(nullpdb);
 	}
@@ -1338,6 +1340,7 @@ static struct aa_profile *unpack_profile(struct aa_ext *e, char **ns_name)
 				goto fail;
 			}
 		}
+		aa_pdb_fold_accept_flags(rules->file);
 	} else if (rules->policy->dfa &&
 		   rules->policy->start[AA_CLASS_FILE]) {
 		aa_put_pdb(rules->file);
@@ -1489,7 +1492,8 @@ static bool verify_dfa_accept_index(struct aa_dfa *dfa, int table_size)
 {
 	int i;
 	for (i = 0; i < dfa->tables[YYTD_ID_ACCEPT]->td_lolen; i++) {
-		if (ACCEPT_TABLE(dfa)[i] >= table_size)
+		u32 idx = ACCEPT_TABLE(dfa)[i] & AA_ACCEPT_INDEX_MASK;
+		if (idx >= table_size)
 			return false;
 	}
 	return true;
