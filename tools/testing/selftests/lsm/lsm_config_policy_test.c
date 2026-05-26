@@ -244,6 +244,26 @@ TEST(oversize_load)
 	ASSERT_EQ(E2BIG, errno);
 }
 
+/*
+ * REMOVE has a tighter cap (AA_REMOVE_MAX_SIZE = 1024 bytes). Anything
+ * larger -> E2BIG. We exercise it via self_policy where the check is
+ * on the whole buffer.
+ */
+TEST(oversize_remove)
+{
+	char buf[2048] = {0};
+
+	if (!has_cap_mac_admin())
+		SKIP(return, "This test needs CAP_MAC_ADMIN");
+	if (!is_lsm_active(LSM_ID_APPARMOR))
+		SKIP(return, "AppArmor is not active");
+
+	errno = 0;
+	ASSERT_EQ(-1, lsm_config_policy(LSM_ID_APPARMOR, LSM_POLICY_REMOVE,
+					buf, sizeof(buf), LSM_CONFIG_SELF, 0));
+	ASSERT_EQ(E2BIG, errno);
+}
+
 /* Any non-zero @flags is rejected with EOPNOTSUPP at the LSM hook. */
 TEST(flags_nonzero)
 {
@@ -355,6 +375,83 @@ TEST(apparmor_system_load)
 
 	free(buf);
 	rmdir(subns_dir);
+}
+
+/*
+ * AppArmor system-wide policy REPLACE: load then replace; replace must
+ * succeed for an existing profile (LOAD would EEXIST).
+ */
+TEST(apparmor_system_replace)
+{
+	const char *subns_name = "lsm_cfg_kselftest_repl";
+	const char *subns_dir =
+		"/sys/kernel/security/apparmor/policy/namespaces/lsm_cfg_kselftest_repl";
+	size_t name_len = strlen(subns_name);
+	size_t raw_size = 0;
+	void *raw_data;
+	void *buf;
+	size_t buf_size;
+
+	if (!has_cap_mac_admin())
+		SKIP(return, "This test needs CAP_MAC_ADMIN");
+	if (!is_lsm_active(LSM_ID_APPARMOR))
+		SKIP(return, "AppArmor is not active");
+
+	raw_data = borrow_aa_raw_data(&raw_size);
+	if (!raw_data)
+		SKIP(return, "No AppArmor raw_data available");
+
+	rmdir(subns_dir);
+	if (mkdir(subns_dir, 0755) < 0) {
+		free(raw_data);
+		SKIP(return, "Cannot create AppArmor sub-namespace");
+	}
+
+	buf_size = name_len + 1 + raw_size;
+	buf = malloc(buf_size);
+	ASSERT_NE(NULL, buf);
+	memcpy(buf, subns_name, name_len);
+	((char *)buf)[name_len] = '\0';
+	memcpy((char *)buf + name_len + 1, raw_data, raw_size);
+	free(raw_data);
+
+	/* First LOAD must succeed (empty namespace). */
+	errno = 0;
+	ASSERT_EQ(0, lsm_config_policy(LSM_ID_APPARMOR, LSM_POLICY_LOAD, buf,
+				       buf_size, 0, 0));
+
+	/* Second LOAD must fail with EEXIST. */
+	errno = 0;
+	ASSERT_EQ(-1, lsm_config_policy(LSM_ID_APPARMOR, LSM_POLICY_LOAD, buf,
+					buf_size, 0, 0));
+	ASSERT_EQ(EEXIST, errno);
+
+	/* But REPLACE must succeed. */
+	errno = 0;
+	ASSERT_EQ(0, lsm_config_policy(LSM_ID_APPARMOR, LSM_POLICY_REPLACE,
+				       buf, buf_size, 0, 0));
+
+	free(buf);
+	rmdir(subns_dir);
+}
+
+/*
+ * AppArmor system-wide REMOVE: bogus profile name returns ENOENT. Tests
+ * the error path without depending on knowing a real profile name.
+ */
+TEST(apparmor_system_remove_enoent)
+{
+	static const char buf[] = "\0no_such_profile_xyz_12345";
+
+	if (!has_cap_mac_admin())
+		SKIP(return, "This test needs CAP_MAC_ADMIN");
+	if (!is_lsm_active(LSM_ID_APPARMOR))
+		SKIP(return, "AppArmor is not active");
+
+	errno = 0;
+	ASSERT_EQ(-1, lsm_config_policy(LSM_ID_APPARMOR, LSM_POLICY_REMOVE,
+					(void *)buf, sizeof(buf) - 1, 0, 0));
+	ASSERT_EQ(ENOENT, errno);
 }
 
 /*
@@ -526,6 +623,137 @@ TEST(apparmor_self_policy_load_unprivileged)
 	arg.size = raw_size;
 	ASSERT_EQ(0, run_unprivileged(self_load_child, &arg));
 	free(raw);
+}
+
+/*
+ * REPLACE on self_policy requires CAP_MAC_ADMIN; without it -> EPERM.
+ */
+static int self_replace_unpriv_child(void *arg)
+{
+	struct { const void *raw; size_t size; } *a = arg;
+	int r;
+
+	errno = 0;
+	r = lsm_config_policy(LSM_ID_APPARMOR, LSM_POLICY_REPLACE,
+			      (void *)a->raw, a->size, LSM_CONFIG_SELF, 0);
+	if (r == -1 && errno == EPERM)
+		return 0;
+	fprintf(stderr, "%s: r=%d errno=%d\n", __func__, r, errno);
+	return 1;
+}
+
+TEST(apparmor_self_policy_replace_unprivileged)
+{
+	size_t raw_size = 0;
+	void *raw;
+	struct { const void *raw; size_t size; } arg;
+
+	if (!is_lsm_active(LSM_ID_APPARMOR))
+		SKIP(return, "AppArmor is not active");
+	if (!has_cap_mac_admin())
+		SKIP(return, "Test setup needs CAP_MAC_ADMIN to fork+drop");
+
+	raw = borrow_aa_raw_data(&raw_size);
+	if (!raw)
+		SKIP(return, "No AppArmor raw_data available");
+
+	arg.raw = raw;
+	arg.size = raw_size;
+	ASSERT_EQ(0, run_unprivileged(self_replace_unpriv_child, &arg));
+	free(raw);
+}
+
+/*
+ * REMOVE on self_policy requires CAP_MAC_ADMIN; without it -> EPERM.
+ * (Tested before any LOAD so no transient ns exists, which means even
+ * the inner aa_may_manage_policy path is bypassed: the EPERM must come
+ * from the explicit capable() check in apparmor_lsm_config_self_policy.)
+ */
+static int self_remove_unpriv_child(void *arg)
+{
+	const char *name = arg;
+	int r;
+
+	errno = 0;
+	r = lsm_config_policy(LSM_ID_APPARMOR, LSM_POLICY_REMOVE,
+			      (void *)name, strlen(name), LSM_CONFIG_SELF, 0);
+	if (r == -1 && errno == EPERM)
+		return 0;
+	fprintf(stderr, "%s: r=%d errno=%d\n", __func__, r, errno);
+	return 1;
+}
+
+TEST(apparmor_self_policy_remove_unprivileged)
+{
+	if (!is_lsm_active(LSM_ID_APPARMOR))
+		SKIP(return, "AppArmor is not active");
+	if (!has_cap_mac_admin())
+		SKIP(return, "Test setup needs CAP_MAC_ADMIN to fork+drop");
+
+	ASSERT_EQ(0, run_unprivileged(self_remove_unpriv_child,
+				      (void *)"some_profile_name"));
+}
+
+/*
+ * REPLACE on self_policy with CAP_MAC_ADMIN succeeds. We LOAD first
+ * (so the profile exists in the transient ns), then REPLACE the same
+ * blob.
+ */
+TEST(apparmor_self_policy_replace_privileged)
+{
+	size_t raw_size = 0;
+	void *raw;
+	int r;
+
+	if (!is_lsm_active(LSM_ID_APPARMOR))
+		SKIP(return, "AppArmor is not active");
+	if (!has_cap_mac_admin())
+		SKIP(return, "This test needs CAP_MAC_ADMIN");
+
+	raw = borrow_aa_raw_data(&raw_size);
+	if (!raw)
+		SKIP(return, "No AppArmor raw_data available");
+
+	/* LOAD: 0 or EEXIST acceptable (transient ns is per-task-ctx). */
+	errno = 0;
+	r = lsm_config_policy(LSM_ID_APPARMOR, LSM_POLICY_LOAD, raw,
+			      raw_size, LSM_CONFIG_SELF, 0);
+	ASSERT_TRUE(r == 0 || (r == -1 && errno == EEXIST));
+
+	/* REPLACE must always succeed. */
+	errno = 0;
+	ASSERT_EQ(0, lsm_config_policy(LSM_ID_APPARMOR, LSM_POLICY_REPLACE,
+				       raw, raw_size, LSM_CONFIG_SELF, 0));
+
+	free(raw);
+}
+
+/*
+ * self_policy REMOVE with CAP_MAC_ADMIN against an unknown profile
+ * returns ENOENT (the transient ns may or may not exist; either way no
+ * such profile is loaded under that name).
+ */
+TEST(apparmor_self_policy_remove_enoent)
+{
+	const char *name = "no_such_profile_xyz_12345";
+	int r;
+
+	if (!is_lsm_active(LSM_ID_APPARMOR))
+		SKIP(return, "AppArmor is not active");
+	if (!has_cap_mac_admin())
+		SKIP(return, "This test needs CAP_MAC_ADMIN");
+
+	errno = 0;
+	r = lsm_config_policy(LSM_ID_APPARMOR, LSM_POLICY_REMOVE,
+			      (void *)name, strlen(name), LSM_CONFIG_SELF, 0);
+	/*
+	 * If no self_policy_ns has been allocated yet for this task ctx,
+	 * the kernel returns ENOENT directly (there is nothing to remove
+	 * from). Otherwise aa_remove_profiles returns ENOENT for the
+	 * unknown name. Either way, errno must be ENOENT.
+	 */
+	ASSERT_EQ(-1, r);
+	ASSERT_EQ(ENOENT, errno);
 }
 
 /*
