@@ -1606,9 +1606,9 @@ static struct aa_ns *apparmor_get_or_alloc_self_policy_ns(struct aa_task_ctx *ct
 }
 
 /**
- * apparmor_lsm_config_self_policy - Load policy reserved for the calling task
- * @op: operation to perform. Currently, only LSM_POLICY_LOAD is supported.
- * @buf: user-supplied buffer containing the policy to load.
+ * apparmor_lsm_config_self_policy - Configure policies for the calling task
+ * @op: operation to perform
+ * @buf: user-supplied buffer
  * @size: size of @buf
  * @flags: reserved for future use; must be zero
  *
@@ -1626,9 +1626,10 @@ static int apparmor_lsm_config_self_policy(u32 op, void __user *buf,
 	struct aa_task_ctx *ctx = task_ctx(current);
 	struct aa_ns *self_ns;
 	loff_t pos = 0; /* Partial writing is not currently supported */
+	bool allow_replace;
 	int error;
 
-	if (op != LSM_POLICY_LOAD || flags)
+	if (flags)
 		return -EOPNOTSUPP;
 	if (size == 0)
 		return -EINVAL;
@@ -1642,26 +1643,52 @@ static int apparmor_lsm_config_self_policy(u32 op, void __user *buf,
 	if (aa_g_lock_policy)
 		return -EACCES;
 
+	/* Load is monotonically restrictive and can therefore be used without
+	 * CAP_MAC_ADMIN. Others operations are bound to CAP_MAC_ADMIN.
+	 */
+	switch (op) {
+	case LSM_POLICY_LOAD:
+		allow_replace = false;
+		break;
+	case LSM_POLICY_REPLACE:
+		if (!capable(CAP_MAC_ADMIN))
+			return -EPERM;
+		allow_replace = true;
+		break;
+	case LSM_POLICY_REMOVE:
+		if (!capable(CAP_MAC_ADMIN))
+			return -EPERM;
+		if (size > AA_REMOVE_MAX_SIZE)
+			return -E2BIG;
+		if (!ctx->self_policy_ns)
+			return -ENOENT; /* nothing to remove from */
+		return aa_profile_remove_from_ns(ctx->self_policy_ns, buf,
+						 size);
+	default:
+		return -EOPNOTSUPP;
+	}
+
 	self_ns = apparmor_get_or_alloc_self_policy_ns(ctx);
 	if (IS_ERR(self_ns))
 		return PTR_ERR(self_ns);
 
-	error = aa_profile_load_self(false, self_ns, buf, size, &pos);
+	error = aa_profile_load_self(allow_replace, self_ns, buf, size, &pos);
 	if (error)
 		return error;
+
 
 	return apparmor_stack_self_policy_profiles(self_ns);
 }
 
 /**
- * apparmor_lsm_config_system_policy - Load a system policy
- * @op: operation to perform. Currently, only LSM_POLICY_LOAD is supported
- * @buf: user-supplied buffer in the form "<ns>\0<policy>"
- *        <ns> is the namespace to load the policy into, relative to the
- *        caller's current AppArmor namespace (empty string for the caller's
- *        current namespace). A task confined to a sub-namespace cannot
- *        target a sibling or parent namespace.
- *        <policy> is the policy to load
+ * apparmor_lsm_config_system_policy - Configure a system policy
+ * @op: operation to perform
+ * @buf: user-supplied buffer in the form "<ns>\0<payload>"
+ *        <ns> is the namespace to operate on, relative to the caller's
+ *        current AppArmor namespace (empty string for the caller's current
+ *        namespace). A task confined to a sub-namespace cannot target a
+ *        sibling or parent namespace.
+ *        <payload> is the policy to operate on.
  * @size: size of @buf
  * @flags: reserved for future uses; must be zero
  *
@@ -1674,8 +1701,11 @@ static int apparmor_lsm_config_system_policy(u32 op, void __user *buf,
 	char ns_name[AA_PROFILE_NAME_MAX_SIZE];
 	size_t ns_size;
 	size_t max_ns_size = min(size, AA_PROFILE_NAME_MAX_SIZE);
+	void __user *payload;
+	size_t payload_size;
+	bool allow_replace;
 
-	if (op != LSM_POLICY_LOAD || flags)
+	if (flags)
 		return -EOPNOTSUPP;
 	if (size < 2)
 		return -EINVAL;
@@ -1688,9 +1718,27 @@ static int apparmor_lsm_config_system_policy(u32 op, void __user *buf,
 	if (ns_size == max_ns_size)
 		return -E2BIG;
 
-	return aa_profile_load_ns_name(false, ns_name, ns_size,
-				       buf + ns_size + 1,
-				       size - ns_size - 1, &pos);
+	payload = buf + ns_size + 1;
+	payload_size = size - ns_size - 1;
+
+	switch (op) {
+	case LSM_POLICY_LOAD:
+		allow_replace = false;
+		break;
+	case LSM_POLICY_REPLACE:
+		allow_replace = true;
+		break;
+	case LSM_POLICY_REMOVE:
+		if (size > AA_REMOVE_MAX_SIZE)
+			return -E2BIG;
+		return aa_profile_remove_ns_name(ns_name, ns_size, payload,
+						 payload_size);
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	return aa_profile_load_ns_name(allow_replace, ns_name, ns_size,
+				       payload, payload_size, &pos);
 }
 
 

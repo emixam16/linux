@@ -515,6 +515,79 @@ end_section:
 }
 
 /**
+ * aa_profile_remove_from_ns - remove a profile (or sub-namespace) by name
+ * @ns: target namespace; caller holds a reference
+ * @buf: user buffer containing the profile or namespace name to remove (text)
+ * @size: size of @buf
+ *
+ * Returns: 0 on success, negative value on error
+ */
+ssize_t aa_profile_remove_from_ns(struct aa_ns *ns,
+				  const char __user *buf, size_t size)
+{
+	struct aa_loaddata *data;
+	struct aa_label *label;
+	loff_t pos = 0;
+	ssize_t error;
+
+	AA_BUG(!ns);
+
+	label = begin_current_label_crit_section();
+	error = aa_may_manage_policy(current_cred(), label, ns, NULL,
+				     AA_MAY_REMOVE_POLICY);
+	if (error)
+		goto out;
+
+	/* + 1 for null terminator*/
+	data = aa_simple_write_to_buffer(buf, size + 1, size, &pos, GFP_KERNEL);
+	error = PTR_ERR(data);
+	if (!IS_ERR(data)) {
+		data->data[size] = 0;
+		error = aa_remove_profiles(ns, label, data->data, size);
+		aa_put_profile_loaddata(data);
+	}
+
+out:
+	end_current_label_crit_section(label);
+
+	return error >= 0 ? 0 : error;
+}
+
+/**
+ * aa_profile_remove_ns_name - remove a profile (or sub-namespace) by name
+ * @name: namespace to remove from, relative to the caller's current ns;
+ *        "" or NULL for the caller's current namespace
+ * @name_size: length of @name (0 for current ns)
+ * @buf: user buffer containing the profile or namespace name to remove (text)
+ * @size: size of @buf
+ *
+ * Returns: 0 on success, negative value on error
+ */
+ssize_t aa_profile_remove_ns_name(char *name, size_t name_size,
+				  const char __user *buf, size_t size)
+{
+	struct aa_ns *current_ns = aa_get_current_ns();
+	struct aa_ns *ns;
+	ssize_t error;
+
+	if (name_size == 0)
+		ns = aa_get_ns(current_ns);
+	else
+		ns = aa_lookupn_ns(current_ns, name, name_size);
+
+	aa_put_ns(current_ns);
+
+	if (!ns)
+		return -EINVAL;
+
+	error = aa_profile_remove_from_ns(ns, buf, size);
+
+	aa_put_ns(ns);
+
+	return error;
+}
+
+/**
  * aa_profile_load_into_ns - load a profile into a specific namespace
  * @allow_replace: allow replacing profiles
  * @ns: target namespace; caller holds a reference

@@ -68,5 +68,6 @@ extern unsigned int aa_g_path_max;
 
 #define AA_PROFILE_NAME_MAX_SIZE (1 << 9)
 #define AA_PROFILE_MAX_SIZE (1 << 25)
+#define AA_REMOVE_MAX_SIZE (1 << 10)
 
 #endif /* __APPARMOR_H */

@@ -123,6 +123,10 @@ ssize_t aa_profile_load_self(bool allow_replace, struct aa_ns *ns,
 ssize_t aa_profile_load_ns_name(bool allow_replace, char *name, size_t name_len,
 				const void __user *buf, size_t size,
 				loff_t *ppos);
+ssize_t aa_profile_remove_from_ns(struct aa_ns *ns,
+				  const char __user *buf, size_t size);
+ssize_t aa_profile_remove_ns_name(char *name, size_t name_len,
+				  const char __user *buf, size_t size);
 
 
 struct aa_loaddata;
