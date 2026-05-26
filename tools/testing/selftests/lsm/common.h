@@ -28,6 +28,16 @@ static inline int lsm_list_modules(__u64 *ids, __u32 *size, __u32 flags)
 }
 #endif
 
+#ifndef lsm_config_policy
+static inline int lsm_config_policy(__u32 lsm_id, __u32 op, void *buf,
+				    __u32 size, __u32 common_flags,
+				    __u32 flags)
+{
+	return syscall(__NR_lsm_config_policy, lsm_id, op, buf, size,
+		       common_flags, flags);
+}
+#endif
+
 extern int read_proc_attr(const char *attr, char *value, size_t size);
 extern int read_sysfs_lsms(char *lsms, size_t size);
 int attr_lsm_count(void);
