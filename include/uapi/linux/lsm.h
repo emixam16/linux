@@ -97,6 +97,8 @@ struct lsm_ctx {
 
 #define LSM_POLICY_UNDEF	0
 #define LSM_POLICY_LOAD		100
+#define LSM_POLICY_REPLACE	101
+#define LSM_POLICY_REMOVE	102
 
 /*
  * LSM_CONFIG_XXX definitions identify special handling

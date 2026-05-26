@@ -133,7 +133,12 @@ SYSCALL_DEFINE3(lsm_list_modules, u64 __user *, ids, u32 __user *, size,
  * @lsm_id: identifier of the target LSM (one of LSM_ID_*)
  * @op: operation to perform on the policy. Defined operations:
  *
- *	* %LSM_POLICY_LOAD - load a new policy fragment
+ *	* %LSM_POLICY_LOAD - load a new policy fragment (fails with
+ *	  -EEXIST if a profile of the same name already exists)
+ *	* %LSM_POLICY_REPLACE - load a policy fragment, replacing any
+ *	  existing profile of the same name
+ *	* %LSM_POLICY_REMOVE - remove a profile (or sub-namespace) by
+ *	  name
  *
  *	Operations not supported by the targeted LSM return -EOPNOTSUPP.
  * @buf: user-space pointer to the policy payload. The exact layout is

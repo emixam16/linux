@@ -66,7 +66,15 @@ Operation codes
 The ``op`` argument is one of the ``LSM_POLICY_*`` constants defined in
 ``<linux/lsm.h>``:
 
-``LSM_POLICY_LOAD`` loads a new policy fragment.
+``LSM_POLICY_LOAD`` loads a new policy fragment. If a profile with the
+same name already exists in the target namespace the call fails with
+``-EEXIST``.
+
+``LSM_POLICY_REPLACE`` loads a policy fragment, replacing any existing
+profile of the same name in the target namespace.
+
+``LSM_POLICY_REMOVE`` removes a profile (or sub-namespace) by name.
+
 The format of the policy payload is LSM-specific and is described in
 the per-LSM administrator documentation under
 ``Documentation/admin-guide/LSM/``.
