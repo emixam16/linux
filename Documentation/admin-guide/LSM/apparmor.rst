@@ -86,6 +86,41 @@ If the global ``apparmor.lock_policy=Y`` boot parameter is set, all
 ``lsm_config_policy()`` loads (including self loads) are rejected with
 ``-EACCES``, matching the existing behavior of the ``.load`` file.
 
+Replacing and removing policy
+-----------------------------
+
+Beyond ``LSM_POLICY_LOAD``, AppArmor also implements:
+
+* ``LSM_POLICY_REPLACE``: load a profile, replacing any existing
+  profile of the same name in the target namespace. Functionally
+  equivalent to writing the policy to the ``.replace`` file in
+  ``apparmorfs``. The payload layout matches ``LSM_POLICY_LOAD``.
+
+* ``LSM_POLICY_REMOVE``: remove a profile (or sub-namespace) by
+  name. The payload layout is the same ``"<ns>\0<name>"`` for
+  system-wide REMOVE; for self REMOVE it is the profile name alone
+  (operating on the caller's transient sub-namespace).
+
+Capability rules
+~~~~~~~~~~~~~~~~
+
+For system-wide REPLACE and REMOVE the syscall layer requires
+``CAP_MAC_ADMIN`` in the initial user namespace, same as LOAD.
+
+For ``LSM_CONFIG_SELF``:
+
+* ``LSM_POLICY_LOAD`` is permitted without ``CAP_MAC_ADMIN`` (it is
+  monotonically restrictive).
+* ``LSM_POLICY_REPLACE`` and ``LSM_POLICY_REMOVE`` require
+  ``CAP_MAC_ADMIN``. REPLACE can swap a restrictive profile for a
+  weaker one and REMOVE can unload a stacked profile entirely; either
+  could relax confinement that the caller previously imposed on
+  itself, so neither is safe to expose unprivileged.
+
+A self REMOVE issued before any prior self-policy LOAD by the calling
+task (so no transient sub-namespace has been allocated) returns
+``-ENOENT``.
+
 Documentation
 =============
 
