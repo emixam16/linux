@@ -165,14 +165,33 @@ void aa_free_ns(struct aa_ns *ns)
 }
 
 /*
- * Policy-namespace resource accounting.
+ * Policy-namespace resource accounting and quota admission.
  *
- * struct aa_ns_acct holds live per-namespace usage counters (atomic, so they
- * are safe to read without ns->lock): resident policy bytes and the profile and
- * child-namespace counts. Resident policy is charged and uncharged at the
- * synchronous install/unload points under ns->lock. The standing caps carried
- * alongside are populated and enforced separately.
+ * Two constructs share struct aa_ns_acct: live usage counters (atomic, so
+ * they are safe to read without ns->lock) and the standing caps. Caps use the
+ * sentinel AA_NS_NOLIMIT (-1) to mean "unset/unlimited"; a cap of 0 is a valid
+ * deny. Enforcement happens at the creation/install chokepoints (this file's
+ * aa_ns_admit_* and policy.c's aa_replace_profiles), never at a grant, so it
+ * binds the self-policy, mkdir and name-routed paths alike.
  */
+
+/* min() treating AA_NS_NOLIMIT as +infinity */
+static long cap_min(long a, long b)
+{
+	if (a == AA_NS_NOLIMIT)
+		return b;
+	if (b == AA_NS_NOLIMIT)
+		return a;
+	return a < b ? a : b;
+}
+
+/* headroom left under @limit given @used; AA_NS_NOLIMIT stays unlimited */
+static long cap_remaining(long limit, long used)
+{
+	if (limit == AA_NS_NOLIMIT)
+		return AA_NS_NOLIMIT;
+	return limit > used ? limit - used : 0;
+}
 
 void aa_ns_acct_init(struct aa_ns *ns)
 {
@@ -196,6 +215,183 @@ void aa_ns_acct_destroy(struct aa_ns *ns)
 	/* obj_cgroup_put() is a no-op stub when !CONFIG_MEMCG */
 	obj_cgroup_put(ns->acct.objcg);
 	ns->acct.objcg = NULL;
+}
+
+/* return true if a record should be emitted (false == ratelimited away) */
+static bool ns_quota_ratelimited(struct aa_ns *ns)
+{
+	return __ratelimit(&ns->acct.ratelimit);
+}
+
+static void audit_quota_cb(struct audit_buffer *ab, void *va)
+{
+	struct apparmor_audit_data *ad = aad_of_va(va);
+
+	if (ad->iface.limit)
+		audit_log_format(ab, " limit=\"%s\"", ad->iface.limit);
+	audit_log_format(ab, " requested=%ld available=%ld",
+			 ad->iface.requested, ad->iface.available);
+	if (ad->iface.ns) {
+		audit_log_format(ab, " namespace=");
+		audit_log_untrustedstring(ab, ad->iface.ns);
+	}
+}
+
+/*
+ * Emit a ratelimited OP_NS_QUOTA denial for @ns and return @error so callers
+ * can `return ns_quota_deny(...)`. @cap names the exceeded cap (emitted as
+ * limit="<cap>"); @requested and @available are in the cap's native unit. The
+ * record matches the parser's libapparmor testcase_policyns_quota format:
+ *   operation="ns_quota" info="quota_exceeded" error=<errno>
+ *   limit="<cap>" requested=<n> available=<n>
+ *   profile="<subject>" namespace="<target ns>"
+ * (no class= field). The subject is the current task's confining label.
+ */
+static int ns_quota_deny(struct aa_ns *ns, const char *cap,
+			 long requested, long available, int error)
+{
+	DEFINE_AUDIT_DATA(ad, LSM_AUDIT_DATA_NONE, AA_CLASS_NONE, OP_NS_QUOTA);
+
+	if (!ns_quota_ratelimited(ns))
+		return error;
+
+	ad.subj_label = aa_current_raw_label();
+	ad.info = "quota_exceeded";
+	ad.error = error;
+	ad.iface.ns = ns->base.hname;
+	ad.iface.limit = cap;
+	ad.iface.requested = requested;
+	ad.iface.available = available;
+	aa_audit_msg(AUDIT_APPARMOR_DENIED, &ad, audit_quota_cb);
+
+	return error;
+}
+
+/**
+ * aa_ns_admit_create - structural admission for creating a child of @parent
+ * @parent: the namespace a child is being created under
+ *
+ * Requires: @parent->lock held. Enforces the breadth (namespaces) and depth
+ * caps. Reads of the usage counters are stable here because every creation
+ * path holds @parent->lock while creating.
+ *
+ * Returns: 0 to admit, -EDQUOT (count cap) or -ENOSPC (depth cap) to deny.
+ */
+int aa_ns_admit_create(struct aa_ns *parent)
+{
+	struct aa_ns_caps *pl = &parent->acct.limits;
+	long used;
+
+	if (!aa_g_policy_ns_quota)
+		return 0;
+
+	if (pl->namespaces != AA_NS_NOLIMIT) {
+		used = atomic_long_read(&parent->acct.ns_count);
+		if (used >= pl->namespaces)
+			return ns_quota_deny(parent, "namespaces",
+					     used + 1, 0, -EDQUOT);
+	}
+	/* a depth cap of N permits N levels below; 0 denies any child */
+	if (pl->depth != AA_NS_NOLIMIT && pl->depth <= 0)
+		return ns_quota_deny(parent, "depth", 1, 0, -ENOSPC);
+
+	return 0;
+}
+
+/**
+ * aa_ns_admit_payload - Stage A coarse memory gate before unpack
+ * @ns: the creating/target namespace whose memory cap applies
+ * @payload: uncompressed wire payload size (udata->size)
+ *
+ * The resident DFA tables are allocated inside aa_unpack(), before the target
+ * ns is locked, so the OOM-preventing check is a coarse pre-unpack gate: the
+ * uncompressed payload is a sound conservative upper bound on resident size
+ * (the load path never decompresses and tables copy ~1:1). Fail-closed.
+ *
+ * Returns: 0 to admit, -ENOSPC if the payload alone cannot fit the cap.
+ */
+int aa_ns_admit_payload(struct aa_ns *ns, size_t payload)
+{
+	/*
+	 * Stage A runs before ns->lock, so this caps read can race a
+	 * concurrent aa_ns_apply_caps() on the same ns. The read of an aligned
+	 * long is a best-effort snapshot for this coarse gate; Stage B re-reads
+	 * the cap precisely under ns->lock.
+	 */
+	long limit = data_race(ns->acct.limits.memory);
+
+	if (!aa_g_policy_ns_quota || limit == AA_NS_NOLIMIT)
+		return 0;
+	if ((long)payload > limit)
+		return ns_quota_deny(ns, "memory", (long)payload, limit,
+				     -ENOSPC);
+	return 0;
+}
+
+/**
+ * aa_ns_admit_resident - Stage B pre-commit memory accounting check
+ * @ns: target namespace
+ * @delta: net resident bytes the load set adds (new resident minus the
+ *	   resident of profiles it replaces); may be negative
+ *
+ * Requires: @ns->lock held. Checks current_usage + delta against the cap so
+ * an idempotent reload (delta <= 0) is never falsely denied.
+ *
+ * Returns: 0 to admit, -ENOSPC on breach.
+ */
+int aa_ns_admit_resident(struct aa_ns *ns, long delta)
+{
+	long limit = ns->acct.limits.memory;
+	long cur;
+
+	if (!aa_g_policy_ns_quota || limit == AA_NS_NOLIMIT)
+		return 0;
+	cur = atomic_long_read(&ns->acct.resident);
+	if (cur + delta > limit)
+		return ns_quota_deny(ns, "memory", cur + delta,
+				     cap_remaining(limit, cur), -ENOSPC);
+	return 0;
+}
+
+/**
+ * aa_ns_admit_profile_size - per-profile byte cap (max_profile)
+ * @ns: target namespace
+ * @bytes: the profile's resident size (precomputed by the caller)
+ *
+ * The caller passes the already-computed resident size and skips the check
+ * for null/missing-ancestor profiles (shared nullpdb, near-zero resident).
+ * Returns 0 to admit, -ENOSPC if the profile exceeds max_profile.
+ */
+int aa_ns_admit_profile_size(struct aa_ns *ns, long bytes)
+{
+	long limit = ns->acct.limits.max_profile;
+
+	if (!aa_g_policy_ns_quota || limit == AA_NS_NOLIMIT)
+		return 0;
+	if (bytes > limit)
+		return ns_quota_deny(ns, "max_profile", bytes, limit, -ENOSPC);
+	return 0;
+}
+
+/**
+ * aa_ns_admit_count - profile-count cap (profiles)
+ * @ns: target namespace
+ * @delta: net non-null profiles the load set adds (may be negative)
+ *
+ * Requires: @ns->lock held. Returns 0 to admit, -EDQUOT on breach.
+ */
+int aa_ns_admit_count(struct aa_ns *ns, long delta)
+{
+	long limit = ns->acct.limits.profiles;
+	long cur;
+
+	if (!aa_g_policy_ns_quota || limit == AA_NS_NOLIMIT || delta <= 0)
+		return 0;
+	cur = atomic_long_read(&ns->acct.profile_count);
+	if (cur + delta > limit)
+		return ns_quota_deny(ns, "profiles", cur + delta,
+				     cap_remaining(limit, cur), -EDQUOT);
+	return 0;
 }
 
 /**
@@ -241,6 +437,143 @@ void aa_ns_uncharge_profile(struct aa_profile *profile)
 	if (!(profile->label.flags & FLAG_NULL))
 		atomic_long_dec(&ns->acct.profile_count);
 	profile->acct_resident = 0;
+}
+
+/**
+ * aa_ns_apply_caps - apply a parsed cap set to @ns's own caps (self target)
+ * @ns: namespace whose caps are being set
+ * @caps: parsed caps; AA_NS_NOLIMIT fields are left untouched
+ *
+ * Requires: @ns->lock held. The limits.* fields are plain longs; this writer
+ * holds ns->lock and the admission checks read them under the same lock, so
+ * no atomics are needed. The only lockless readers are the coarse Stage A
+ * gate and the securityfs introspection files, which tolerate a best-effort
+ * snapshot (they use data_race() on aligned-long reads).
+ *
+ * Tighten-only: a namespace may lower but never raise its own caps. A tighter
+ * cap on an already-over-budget ns is accepted (overage is tolerated; later
+ * non-reducing loads are then rejected by the admission checks).
+ */
+static void aa_ns_apply_caps(struct aa_ns *ns, struct aa_ns_caps *caps)
+{
+	struct aa_ns_caps *l = &ns->acct.limits;
+
+	if (caps->memory != AA_NS_NOLIMIT)
+		l->memory = cap_min(l->memory, caps->memory);
+	if (caps->max_profile != AA_NS_NOLIMIT)
+		l->max_profile = cap_min(l->max_profile, caps->max_profile);
+	if (caps->profiles != AA_NS_NOLIMIT)
+		l->profiles = cap_min(l->profiles, caps->profiles);
+	if (caps->namespaces != AA_NS_NOLIMIT)
+		l->namespaces = cap_min(l->namespaces, caps->namespaces);
+	if (caps->depth != AA_NS_NOLIMIT)
+		l->depth = cap_min(l->depth, caps->depth);
+	if (caps->criu != AA_NS_NOLIMIT)
+		l->criu = cap_min(l->criu, caps->criu);
+	if (caps->load_rate != AA_NS_NOLIMIT)
+		l->load_rate = cap_min(l->load_rate, caps->load_rate);
+}
+
+/**
+ * aa_ns_set_child_caps - stamp a parsed cap set as @ns's children template
+ * @ns: namespace whose children template is being set
+ * @caps: parsed caps to apply to namespaces @ns creates
+ */
+static void aa_ns_set_child_caps(struct aa_ns *ns, struct aa_ns_caps *caps)
+{
+	ns->acct.child = *caps;
+}
+
+/*
+ * budget_to_caps - project a parsed budget's absolute caps into an aa_ns_caps
+ *
+ * Only keys that are @specified and NOT percentages become absolute caps;
+ * percentage caps are left unset because proportional (%) sizing is not yet
+ * enforced (M2). The key order matches struct aa_ns_caps field order exactly
+ * (checked at build time), so values[k] lands on the k-th cap.
+ */
+static void budget_to_caps(struct aa_ns_budget *b, struct aa_ns_caps *caps)
+{
+	long *cap = (long *)caps;
+	int k;
+
+	BUILD_BUG_ON(sizeof(*caps) != AA_POLICYNS_KEY_MAX * sizeof(long));
+
+	aa_ns_caps_init_unset(caps);
+	for (k = 0; k < AA_POLICYNS_KEY_MAX; k++) {
+		if (!(b->specified & (1u << k)))
+			continue;
+		if (b->percent & (1u << k))
+			continue;	/* % enforcement deferred (M2) */
+		cap[k] = b->values[k];
+	}
+}
+
+/**
+ * aa_ns_apply_budget - apply one parsed "policyns limits" block to @ns
+ * @ns: the namespace the load targets  (NOT NULL)
+ * @b: one parsed budget block
+ *
+ * Requires: @ns->lock held. Dispatches on the block target:
+ *   - self:     tighten @ns's own caps
+ *   - children: set @ns's children template
+ *   - descendants/root/:NAME:: routing deferred (M3/M4); consumed but not
+ *     applied so the load still succeeds. The subtree scope is likewise
+ *     deferred (M3); v1 accounts locally regardless of @scope.
+ */
+void aa_ns_apply_budget(struct aa_ns *ns, struct aa_ns_budget *b)
+{
+	struct aa_ns_caps caps;
+
+	switch (b->target) {
+	case AA_POLICYNS_TGT_SELF:
+		budget_to_caps(b, &caps);
+		aa_ns_apply_caps(ns, &caps);
+		break;
+	case AA_POLICYNS_TGT_CHILDREN:
+		budget_to_caps(b, &caps);
+		aa_ns_set_child_caps(ns, &caps);
+		break;
+	default:
+		break;
+	}
+}
+
+/*
+ * inherit_child_caps - compute a new child's caps from @parent's template
+ *
+ * effective child cap = min(template, parent.remaining) evaluated at creation,
+ * with parent.remaining floored at 0. depth is a budget that decrements down
+ * the tree. Requires @parent->lock held.
+ */
+static void inherit_child_caps(struct aa_ns *child, struct aa_ns *parent)
+{
+	struct aa_ns_caps *t = &parent->acct.child;
+	struct aa_ns_caps *pl = &parent->acct.limits;
+	struct aa_ns_caps *cl = &child->acct.limits;
+	struct aa_ns_acct *pa = &parent->acct;
+
+	cl->memory = cap_min(t->memory,
+			     cap_remaining(pl->memory,
+					   atomic_long_read(&pa->resident)));
+	cl->profiles = cap_min(t->profiles,
+			       cap_remaining(pl->profiles,
+					     atomic_long_read(&pa->profile_count)));
+	cl->namespaces = cap_min(t->namespaces,
+				 cap_remaining(pl->namespaces,
+					       atomic_long_read(&pa->ns_count)));
+	cl->max_profile = cap_min(t->max_profile, pl->max_profile);
+	cl->criu = cap_min(t->criu, pl->criu);
+	cl->load_rate = cap_min(t->load_rate, pl->load_rate);
+	if (pl->depth != AA_NS_NOLIMIT)
+		cl->depth = cap_min(t->depth, pl->depth - 1);
+	else
+		cl->depth = t->depth;
+	/*
+	 * The children template is one level deep (`children` target); it is
+	 * not propagated to grandchildren here. Subtree-wide propagation
+	 * (`descendants`) is deferred (M3).
+	 */
 }
 
 /**
@@ -310,10 +643,16 @@ static struct aa_ns *__aa_create_ns(struct aa_ns *parent, const char *name,
 	/* root_ns is level 0, so a child at MAX_NS_DEPTH is the deepest */
 	if (parent->level >= MAX_NS_DEPTH)
 		return ERR_PTR(-ENOSPC);
+	/* per-ns structural caps: breadth and depth */
+	error = aa_ns_admit_create(parent);
+	if (error)
+		return ERR_PTR(error);
 	ns = alloc_ns(parent->base.hname, name);
 	if (!ns)
 		return ERR_PTR(-ENOMEM);
 	ns->level = parent->level + 1;
+	/* effective child caps = min(parent template, parent.remaining) */
+	inherit_child_caps(ns, parent);
 	mutex_lock_nested(&ns->lock, ns->level);
 	error = __aafs_ns_mkdir(ns, ns_subns_dir(parent), name, dir);
 	if (error) {

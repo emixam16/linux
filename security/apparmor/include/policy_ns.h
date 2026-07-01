@@ -126,6 +126,16 @@ void aa_ns_acct_init(struct aa_ns *ns);
 void aa_ns_acct_destroy(struct aa_ns *ns);
 void aa_ns_charge_profile(struct aa_profile *profile);
 void aa_ns_uncharge_profile(struct aa_profile *profile);
+/* structural admission, under parent->lock */
+int aa_ns_admit_create(struct aa_ns *parent);
+/* memory admission: Stage A (coarse, pre-unpack) and Stage B (pre-commit) */
+int aa_ns_admit_payload(struct aa_ns *ns, size_t payload);
+int aa_ns_admit_resident(struct aa_ns *ns, long delta);
+/* per-profile and count admission, under ns->lock */
+int aa_ns_admit_profile_size(struct aa_ns *ns, long bytes);
+int aa_ns_admit_count(struct aa_ns *ns, long delta);
+/* apply one parsed "policyns limits" block to the target ns (under ns->lock) */
+void aa_ns_apply_budget(struct aa_ns *ns, struct aa_ns_budget *budget);
 
 static inline struct aa_profile *aa_deref_parent(struct aa_profile *p)
 {

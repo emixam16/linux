@@ -1271,6 +1271,20 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 
 	op = mask & AA_MAY_REPLACE_POLICY ? OP_PROF_REPL : OP_PROF_LOAD;
 	aa_get_profile_loaddata(udata);
+
+	/*
+	 * Stage A: coarse pre-unpack memory gate. The resident DFA tables are
+	 * allocated inside aa_unpack() before the target ns is known or
+	 * locked, so the OOM-preventing check is up front against the creating
+	 * ns's memory cap, using the uncompressed payload as a conservative
+	 * upper bound. For name-routed loads the target ns (discovered during
+	 * unpack) is re-checked precisely by Stage B.
+	 */
+	error = aa_ns_admit_payload(policy_ns ? policy_ns : labels_ns(label),
+				    udata->size);
+	if (error)
+		goto out;
+
 	/* released below */
 	error = aa_unpack(udata, &lh, &ns_name);
 	if (error)
