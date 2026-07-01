@@ -178,6 +178,84 @@ struct aa_data {
 	struct rhash_head head;
 };
 
+/*
+ * Sentinel for a policy-namespace cap that has not been set: the resource is
+ * unlimited. A cap value of 0 is valid and means "deny" (see the policy-ns
+ * quota spec). All real caps are therefore >= 0; only AA_NS_NOLIMIT means
+ * "no cap".
+ */
+#define AA_NS_NOLIMIT (-1L)
+
+/* struct aa_ns_caps - standing resource caps for a policy namespace
+ * @memory: max resident policy bytes for the namespace (local scope)
+ * @max_profile: max resident bytes for any single profile loaded into the ns
+ * @profiles: max number of (non-null) profiles in the namespace
+ * @namespaces: max number of direct child namespaces
+ * @depth: max relative nesting depth permitted below the namespace
+ * @criu: max criu reserve bytes (stored; enforcement is M3)
+ * @load_rate: max load/replace ops per minute (stored; enforcement is M4)
+ *
+ * Each field is a maximum (implicit <=). AA_NS_NOLIMIT (-1) means the cap is
+ * unset (unlimited); a value of 0 is a valid cap meaning deny. Size caps are
+ * bytes, count caps are objects. Defined here (rather than in policy_ns.h) so
+ * that the load-time unpack path can build one without the namespace header.
+ */
+struct aa_ns_caps {
+	long memory;
+	long max_profile;
+	long profiles;
+	long namespaces;
+	long depth;
+	long criu;
+	long load_rate;
+};
+
+/* initialise every cap to unset (unlimited) */
+static inline void aa_ns_caps_init_unset(struct aa_ns_caps *c)
+{
+	c->memory = c->max_profile = c->profiles = c->namespaces =
+		c->depth = c->criu = c->load_rate = AA_NS_NOLIMIT;
+}
+
+/*
+ * Wire encoding of a "policyns limits" block, as emitted by the parser's
+ * sd_serialize_policyns() inside each profile after rlimits. These constants
+ * MUST match parser/policyns.h (POLICYNS_TGT_*, POLICYNS_SCOPE_*,
+ * POLICYNS_KEY_*). The @values array is indexed by key in the same order as
+ * the fields of struct aa_ns_caps, so a key maps directly onto a cap.
+ */
+#define AA_POLICYNS_TGT_SELF		0
+#define AA_POLICYNS_TGT_CHILDREN	1
+#define AA_POLICYNS_TGT_DESCENDANTS	2
+#define AA_POLICYNS_TGT_ROOT		3
+#define AA_POLICYNS_TGT_NAME		4
+
+#define AA_POLICYNS_SCOPE_UNSPEC	0
+#define AA_POLICYNS_SCOPE_LOCAL		1
+#define AA_POLICYNS_SCOPE_SUBTREE	2
+
+#define AA_POLICYNS_KEY_MAX		7	/* == fields in aa_ns_caps */
+
+/* struct aa_ns_budget - one parsed "policyns limits" block from a profile
+ * @target: which namespace the block addresses (AA_POLICYNS_TGT_*)
+ * @scope: local/subtree accounting scope (AA_POLICYNS_SCOPE_*)
+ * @specified: bitmask of keys present (bit k == key k)
+ * @percent: bitmask of keys whose value is a percentage of the parent
+ * @values: cap values by key, valid only where @specified has the bit set
+ * @name: literal ns name for AA_POLICYNS_TGT_NAME (owned), else NULL
+ *
+ * Carried on the profile the block was written in (like rlimits); the caps
+ * are ns-scoped and applied to the target namespace at load under ns->lock.
+ */
+struct aa_ns_budget {
+	u32 target;
+	u32 scope;
+	u32 specified;
+	u32 percent;
+	long values[AA_POLICYNS_KEY_MAX];
+	char *name;
+};
+
 /* struct aa_ruleset - data covering mediation rules
  * @list: list the rule is on
  * @size: the memory consumed by this ruleset
@@ -277,6 +355,22 @@ struct aa_profile {
 	struct rhashtable *data;
 
 	int n_rules;
+
+	/*
+	 * Resident policy bytes currently charged to ns->acct for this
+	 * profile, or 0 if not charged. Set at install (go-live), cleared at
+	 * unload. Used as the exact uncharge amount and as an idempotency
+	 * guard so charge/uncharge fire at most once and always pair, even
+	 * across the inherit/replace/null-ancestor paths.
+	 */
+	long acct_resident;
+
+	/* parsed "policyns limits" blocks carried by this profile (NULL/0 for
+	 * the common case); applied to the target ns at load time
+	 */
+	struct aa_ns_budget *budgets;
+	int n_budgets;
+
 	/* special - variable length must be last entry in profile */
 	struct aa_label label;
 };

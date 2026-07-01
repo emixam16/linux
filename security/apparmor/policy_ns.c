@@ -12,11 +12,14 @@
  */
 
 #include <linux/list.h>
+#include <linux/memcontrol.h>
 #include <linux/mutex.h>
+#include <linux/ratelimit.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 
 #include "include/apparmor.h"
+#include "include/audit.h"
 #include "include/cred.h"
 #include "include/policy_ns.h"
 #include "include/label.h"
@@ -117,6 +120,7 @@ static struct aa_ns *alloc_ns(const char *prefix, const char *name)
 	INIT_LIST_HEAD(&ns->rawdata_list);
 	mutex_init(&ns->lock);
 	init_waitqueue_head(&ns->wait);
+	aa_ns_acct_init(ns);
 
 	/* released by aa_free_ns() */
 	ns->unconfined = alloc_unconfined("unconfined");
@@ -152,11 +156,91 @@ void aa_free_ns(struct aa_ns *ns)
 
 	aa_policy_destroy(&ns->base);
 	aa_labelset_destroy(&ns->labels);
+	aa_ns_acct_destroy(ns);
 	aa_put_ns(ns->parent);
 
 	ns->unconfined->ns = NULL;
 	aa_free_profile(ns->unconfined);
 	kfree_sensitive(ns);
+}
+
+/*
+ * Policy-namespace resource accounting.
+ *
+ * struct aa_ns_acct holds live per-namespace usage counters (atomic, so they
+ * are safe to read without ns->lock): resident policy bytes and the profile and
+ * child-namespace counts. Resident policy is charged and uncharged at the
+ * synchronous install/unload points under ns->lock. The standing caps carried
+ * alongside are populated and enforced separately.
+ */
+
+void aa_ns_acct_init(struct aa_ns *ns)
+{
+	struct aa_ns_acct *acct = &ns->acct;
+
+	aa_ns_caps_init_unset(&acct->limits);
+	aa_ns_caps_init_unset(&acct->child);
+	atomic_long_set(&acct->resident, 0);
+	atomic_long_set(&acct->profile_count, 0);
+	atomic_long_set(&acct->ns_count, 0);
+	ratelimit_state_init(&acct->ratelimit,
+			     AA_NS_QUOTA_RATELIMIT_INTERVAL,
+			     AA_NS_QUOTA_RATELIMIT_BURST);
+	/* suppressed records are summarised, not warned about, per ns */
+	ratelimit_set_flags(&acct->ratelimit, RATELIMIT_MSG_ON_RELEASE);
+	acct->objcg = NULL;
+}
+
+void aa_ns_acct_destroy(struct aa_ns *ns)
+{
+	/* obj_cgroup_put() is a no-op stub when !CONFIG_MEMCG */
+	obj_cgroup_put(ns->acct.objcg);
+	ns->acct.objcg = NULL;
+}
+
+/**
+ * aa_ns_charge_profile - charge a profile's resident policy to its ns
+ * @profile: the profile being made live  (NOT NULL)
+ *
+ * Idempotent: the charged byte count is stored on the profile, so a second
+ * charge is a no-op and the stored value is the exact amount uncharged later.
+ * Null profiles are charged for memory (near-zero) but excluded from the
+ * profile count, per spec.
+ */
+void aa_ns_charge_profile(struct aa_profile *profile)
+{
+	struct aa_ns *ns = profile->ns;
+	long bytes;
+
+	if (!ns || profile->acct_resident)
+		return;
+
+	bytes = aa_profile_resident_size(profile);
+	profile->acct_resident = bytes;
+	atomic_long_add(bytes, &ns->acct.resident);
+	if (!(profile->label.flags & FLAG_NULL))
+		atomic_long_inc(&ns->acct.profile_count);
+}
+
+/**
+ * aa_ns_uncharge_profile - reverse aa_ns_charge_profile()
+ * @profile: the profile being unloaded  (NOT NULL)
+ *
+ * No-op if the profile was never charged, so it is safe on every unload path
+ * (replace, remove, inherited-then-replaced, failed load) and cannot drive a
+ * counter negative.
+ */
+void aa_ns_uncharge_profile(struct aa_profile *profile)
+{
+	struct aa_ns *ns = profile->ns;
+
+	if (!ns || !profile->acct_resident)
+		return;
+
+	atomic_long_sub(profile->acct_resident, &ns->acct.resident);
+	if (!(profile->label.flags & FLAG_NULL))
+		atomic_long_dec(&ns->acct.profile_count);
+	profile->acct_resident = 0;
 }
 
 /**
@@ -223,7 +307,8 @@ static struct aa_ns *__aa_create_ns(struct aa_ns *parent, const char *name,
 	AA_BUG(!name);
 	AA_BUG(!mutex_is_locked(&parent->lock));
 
-	if (parent->level > MAX_NS_DEPTH)
+	/* root_ns is level 0, so a child at MAX_NS_DEPTH is the deepest */
+	if (parent->level >= MAX_NS_DEPTH)
 		return ERR_PTR(-ENOSPC);
 	ns = alloc_ns(parent->base.hname, name);
 	if (!ns)
@@ -240,6 +325,8 @@ static struct aa_ns *__aa_create_ns(struct aa_ns *parent, const char *name,
 	}
 	ns->parent = aa_get_ns(parent);
 	list_add_rcu(&ns->base.list, &parent->sub_ns);
+	/* account the new direct child against the parent's breadth cap */
+	atomic_long_inc(&parent->acct.ns_count);
 	/* add list ref */
 	aa_get_ns(ns);
 	mutex_unlock(&ns->lock);
@@ -337,6 +424,9 @@ void __aa_remove_ns(struct aa_ns *ns)
 {
 	/* remove ns from namespace list */
 	list_del_rcu(&ns->base.list);
+	/* release the parent's breadth accounting for this direct child */
+	if (ns->parent)
+		atomic_long_dec(&ns->parent->acct.ns_count);
 	destroy_ns(ns);
 	aa_put_ns(ns);
 }
