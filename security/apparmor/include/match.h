@@ -138,6 +138,7 @@ aa_state_t aa_dfa_matchn_until(struct aa_dfa *dfa, aa_state_t start,
 			       const char *str, int n, const char **retpos);
 
 void aa_dfa_free_kref(struct kref *kref);
+size_t aa_dfa_size(struct aa_dfa *dfa);
 
 /* This needs to be a power of 2 */
 #define WB_HISTORY_SIZE 32

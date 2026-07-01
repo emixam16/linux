@@ -263,6 +263,31 @@ void aa_dfa_free_kref(struct kref *kref)
 	dfa_free(dfa);
 }
 
+/**
+ * aa_dfa_size - compute the resident byte footprint of a dfa
+ * @dfa: dfa to measure (MAYBE NULL)
+ *
+ * Returns: bytes resident for @dfa
+ */
+size_t aa_dfa_size(struct aa_dfa *dfa)
+{
+	size_t size;
+	int i;
+
+	if (!dfa)
+		return 0;
+
+	size = sizeof(*dfa);
+	for (i = 0; i < ARRAY_SIZE(dfa->tables); i++) {
+		struct table_header *t = dfa->tables[i];
+
+		if (t)
+			size += table_size(t->td_lolen, t->td_flags);
+	}
+
+	return size;
+}
+
 
 
 /**
