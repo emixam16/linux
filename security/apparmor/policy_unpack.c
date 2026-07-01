@@ -617,6 +617,119 @@ fail:
 	return false;
 }
 
+/*
+ * unpack_policyns_block - unpack one "policyns limits" block into @b
+ *
+ * Mirrors the parser's sd_serialize_policyns() exactly (a sub-section of the
+ * profile, emitted after rlimits):
+ *
+ *   policyns := AA_STRUCT "policyns"
+ *       u32   target        ; AA_POLICYNS_TGT_*
+ *       u32   scope         ; AA_POLICYNS_SCOPE_*
+ *       u32   specified     ; bitmask of keys present (bit k == key k)
+ *       u32   percent       ; bitmask of keys whose value is a percentage
+ *       AA_ARRAY[AA_POLICYNS_KEY_MAX] of u64   ; cap values by key
+ *       [ AA_STRING "name" ]                   ; only for the :NAME: target
+ *       AA_STRUCTEND
+ *
+ * Every field is bounds-checked by the unpack primitives; values are range
+ * checked (the parser caps them at INT_MAX). Malformed input fails closed.
+ *
+ * Returns: 1 if a block was consumed, 0 if none is present (@e->pos restored),
+ * or a negative errno on malformed input.
+ */
+static int unpack_policyns_block(struct aa_ext *e, struct aa_ns_budget *b)
+{
+	void *pos = e->pos;
+	char *name = NULL;
+	u16 size;
+	int k;
+
+	if (!aa_unpack_nameX(e, AA_STRUCT, "policyns"))
+		return 0;			/* no (more) policyns blocks */
+
+	memset(b, 0, sizeof(*b));
+	if (!aa_unpack_u32(e, &b->target, NULL) ||
+	    !aa_unpack_u32(e, &b->scope, NULL) ||
+	    !aa_unpack_u32(e, &b->specified, NULL) ||
+	    !aa_unpack_u32(e, &b->percent, NULL))
+		goto fail;
+
+	if (!aa_unpack_array(e, NULL, &size) || size != AA_POLICYNS_KEY_MAX)
+		goto fail;
+	for (k = 0; k < AA_POLICYNS_KEY_MAX; k++) {
+		u64 v;
+
+		if (!aa_unpack_u64(e, &v, NULL))
+			goto fail;
+		if (v > INT_MAX)	/* parser bounds caps at INT_MAX */
+			goto fail;	/* out of range: fail closed */
+		b->values[k] = (long)v;
+	}
+	if (!aa_unpack_nameX(e, AA_ARRAYEND, NULL))
+		goto fail;
+
+	/* the literal ns name is present only for the :NAME: target */
+	if (b->target == AA_POLICYNS_TGT_NAME) {
+		if (!aa_unpack_strdup(e, &name, "name"))
+			goto fail;
+		b->name = name;
+	}
+
+	if (!aa_unpack_nameX(e, AA_STRUCTEND, NULL))
+		goto fail;
+
+	/* reject specified/percent bits outside the known key range */
+	if ((b->specified | b->percent) & ~((1u << AA_POLICYNS_KEY_MAX) - 1))
+		goto fail;
+
+	return 1;
+
+fail:
+	kfree(name);
+	b->name = NULL;
+	e->pos = pos;
+	return -EPROTO;
+}
+
+/*
+ * unpack_policyns - collect all "policyns limits" blocks of a profile onto it
+ *
+ * The budget is namespace-scoped; it is stashed on the profile here and
+ * applied to the target ns at load time (aa_replace_profiles), under ns->lock.
+ * Returns 0 (with 0+ blocks recorded) or a negative errno.
+ */
+static int unpack_policyns(struct aa_ext *e, struct aa_profile *profile)
+{
+	struct aa_ns_budget *arr = NULL, blk;
+	int n = 0, i, ret;
+
+	while ((ret = unpack_policyns_block(e, &blk)) > 0) {
+		struct aa_ns_budget *grown;
+
+		grown = krealloc_array(arr, n + 1, sizeof(*arr), GFP_KERNEL);
+		if (!grown) {
+			ret = -ENOMEM;
+			goto fail;
+		}
+		arr = grown;
+		arr[n++] = blk;		/* transfers blk.name ownership to @arr */
+	}
+	if (ret < 0)
+		goto fail;
+
+	profile->budgets = arr;
+	profile->n_budgets = n;
+	return 0;
+
+fail:
+	kfree(blk.name);		/* unstored block on the -ENOMEM path */
+	for (i = 0; i < n; i++)
+		kfree(arr[i].name);
+	kfree(arr);
+	return ret;
+}
+
 static bool unpack_secmark(struct aa_ext *e, struct aa_ruleset *rules)
 {
 	void *pos = e->pos;
@@ -1290,6 +1403,13 @@ static struct aa_profile *unpack_profile(struct aa_ext *e, char **ns_name)
 		goto fail;
 	}
 
+	/* optional policyns limits blocks, emitted by the parser after rlimits */
+	error = unpack_policyns(e, profile);
+	if (error) {
+		info = "failed to unpack policyns limits";
+		goto fail;
+	}
+
 	if (!unpack_secmark(e, rules)) {
 		info = "failed to unpack profile secmark rules";
 		goto fail;
@@ -1403,6 +1523,11 @@ static struct aa_profile *unpack_profile(struct aa_ext *e, char **ns_name)
 	}
 
 	aa_compute_profile_mediates(profile);
+
+	/* revive aa_ruleset.size with the ruleset's resident byte footprint
+	 * (introspection only; quota charging uses the size_t resident helpers)
+	 */
+	rules->size = (int)aa_ruleset_resident_size(rules);
 
 	return profile;
 

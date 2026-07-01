@@ -428,6 +428,10 @@ void aa_free_profile(struct aa_profile *profile)
 	for (int i = 0; i < profile->n_rules; i++)
 		free_ruleset(profile->label.rules[i]);
 
+	for (int i = 0; i < profile->n_budgets; i++)
+		kfree(profile->budgets[i].name);
+	kfree(profile->budgets);
+
 	kfree_sensitive(profile->dirname);
 
 	if (profile->data) {
@@ -1414,6 +1418,71 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 			/* released on profile replacement or free_profile */
 			p = (struct aa_profile *) policy;
 		rcu_assign_pointer(ent->new->parent, aa_get_profile(p));
+	}
+
+	/*
+	 * Apply any "policyns limits" blocks carried by the load's profiles to
+	 * the target ns under its lock, before Stage B, so a load that both
+	 * tightens a cap and adds policy is checked against the new (tighter)
+	 * cap. The budget is ns-scoped: `self` tightens this ns, `children`
+	 * sets its template.
+	 */
+	list_for_each_entry(ent, &lh, list) {
+		int b;
+
+		for (b = 0; b < ent->new->n_budgets; b++)
+			aa_ns_apply_budget(ns, &ent->new->budgets[b]);
+	}
+
+	/*
+	 * Stage B: pre-commit memory and count accounting. Sum the whole load
+	 * set and check it against the target ns caps before installing
+	 * anything, so a breach rejects the set atomically with the live
+	 * counters unchanged. Profiles whose rawdata is unchanged are
+	 * dedup-skipped at install and contribute nothing here, so an
+	 * idempotent reload is never falsely denied.
+	 */
+	if (aa_g_policy_ns_quota) {
+		long new_bytes = 0, old_bytes = 0;
+		long new_count = 0, old_count = 0;
+
+		list_for_each_entry(ent, &lh, list) {
+			long bytes;
+
+			if (ent->old && ent->new->rawdata &&
+			    ent->old->rawdata == ent->new->rawdata)
+				continue;	/* dedup-skipped at install */
+
+			/* resident size computed once per profile and reused */
+			bytes = aa_profile_resident_size(ent->new);
+			if (!(ent->new->label.flags & FLAG_NULL)) {
+				error = aa_ns_admit_profile_size(ns, bytes);
+				if (error) {
+					info = "profile exceeds max_profile cap";
+					goto fail_lock;
+				}
+				new_count++;
+			}
+			new_bytes += bytes;
+			if (ent->old) {
+				old_bytes +=
+					aa_profile_resident_size(ent->old);
+				if (!(ent->old->label.flags & FLAG_NULL))
+					old_count++;
+			}
+		}
+		error = aa_ns_admit_resident(ns, new_bytes - old_bytes);
+		if (error) {
+			info = "namespace memory cap exceeded";
+			ent = NULL;	/* whole-set breach, not one profile */
+			goto fail_lock;
+		}
+		error = aa_ns_admit_count(ns, new_count - old_count);
+		if (error) {
+			info = "namespace profile cap exceeded";
+			ent = NULL;	/* whole-set breach, not one profile */
+			goto fail_lock;
+		}
 	}
 
 	/* create new fs entries for introspection if needed */
