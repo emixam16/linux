@@ -76,6 +76,11 @@ enum aafs_ns_type {
 	AAFS_NS_SIZE,
 	AAFS_NS_MAX_SIZE,
 	AAFS_NS_OWNER,
+	AAFS_NS_MAX_PROFILE,
+	AAFS_NS_NAMESPACES,
+	AAFS_NS_DEPTH,
+	AAFS_NS_CRIU,
+	AAFS_NS_USAGE,
 	AAFS_NS_SIZEOF,
 };
 
@@ -100,6 +105,15 @@ enum aafs_prof_type {
 #define ns_subreplace(X) ((X)->dents[AAFS_NS_REPLACE])
 #define ns_subremove(X) ((X)->dents[AAFS_NS_REMOVE])
 #define ns_subrevision(X) ((X)->dents[AAFS_NS_REVISION])
+#define ns_subcount(X) ((X)->dents[AAFS_NS_COUNT])
+#define ns_submax_count(X) ((X)->dents[AAFS_NS_MAX_COUNT])
+#define ns_subsize(X) ((X)->dents[AAFS_NS_SIZE])
+#define ns_submax_size(X) ((X)->dents[AAFS_NS_MAX_SIZE])
+#define ns_submax_profile(X) ((X)->dents[AAFS_NS_MAX_PROFILE])
+#define ns_subnamespaces(X) ((X)->dents[AAFS_NS_NAMESPACES])
+#define ns_subdepth(X) ((X)->dents[AAFS_NS_DEPTH])
+#define ns_subcriu(X) ((X)->dents[AAFS_NS_CRIU])
+#define ns_subusage(X) ((X)->dents[AAFS_NS_USAGE])
 
 #define prof_dir(X) ((X)->dents[AAFS_PROF_DIR])
 #define prof_child_dir(X) ((X)->dents[AAFS_PROF_PROFS])
