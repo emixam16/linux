@@ -60,7 +60,7 @@ static const char *const aa_class_names[] = {
 	"lsm",
 	"namespace",
 	"io_uring",
-	"unknown",
+	"policy_namespace",
 	"unknown",
 	"unknown",
 	"unknown",

@@ -1876,6 +1876,12 @@ module_param_named(path_max, aa_g_path_max, aauint, S_IRUSR);
 bool aa_g_paranoid_load = IS_ENABLED(CONFIG_SECURITY_APPARMOR_PARANOID_LOAD);
 module_param_named(paranoid_load, aa_g_paranoid_load, aabool, S_IRUGO);
 
+/* Policyns resource quota enforcement.
+ * Default on so a configured children/:NAME: cap binds out of the box.
+ * With no cap configured nothing is limited.
+ */
+int aa_g_policy_ns_quota = 1;
+
 static int param_get_aaintbool(char *buffer, const struct kernel_param *kp);
 static int param_set_aaintbool(const char *val, const struct kernel_param *kp);
 #define param_check_aaintbool param_check_int
@@ -2338,6 +2344,13 @@ static const struct ctl_table apparmor_sysctl_table[] = {
 	{
 		.procname       = "apparmor_restrict_unprivileged_unconfined",
 		.data           = &aa_unprivileged_unconfined_restricted,
+		.maxlen         = sizeof(int),
+		.mode           = 0600,
+		.proc_handler   = apparmor_dointvec,
+	},
+	{
+		.procname       = "apparmor_policy_ns_quota",
+		.data           = &aa_g_policy_ns_quota,
 		.maxlen         = sizeof(int),
 		.mode           = 0600,
 		.proc_handler   = apparmor_dointvec,
