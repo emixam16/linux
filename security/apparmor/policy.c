@@ -444,7 +444,7 @@ void aa_compute_profile_mediates(struct aa_profile *profile)
 
 		for (pos = unconfined_mediates; *pos; pos++) {
 			if (ANY_RULE_MEDIATES(profile, *pos))
-				profile->label.mediates |= ((u64) 1) << AA_CLASS_NS;
+				profile->label.mediates |= ((u64) 1) << *pos;
 		}
 		return;
 	}
