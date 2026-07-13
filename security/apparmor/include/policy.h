@@ -179,7 +179,6 @@ struct aa_data {
 
 /* struct aa_ruleset - data covering mediation rules
  * @list: list the rule is on
- * @size: the memory consumed by this ruleset
  * @policy: general match rules governing policy
  * @file: The set of rules governing basic file access and domain transitions
  * @caps: capabilities for the profile
@@ -188,8 +187,6 @@ struct aa_data {
  * @secmark: secmark label match info
  */
 struct aa_ruleset {
-	int size;
-
 	/* TODO: merge policy and file */
 	struct aa_policydb *policy;
 	struct aa_policydb *file;
