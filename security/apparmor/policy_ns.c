@@ -191,6 +191,17 @@ static long cap_dec(long v)
 	return v > 0 ? v - 1 : 0;
 }
 
+/* @pct percent of @base; unlimited base stays unlimited, floored at 0 */
+static long cap_percent(long base, long pct)
+{
+	if (base == AA_NS_NOLIMIT)
+		return AA_NS_NOLIMIT;
+	if (pct <= 0)
+		return 0;
+	/* base and pct are both <= INT_MAX (parse-time), so u64 can't wrap */
+	return (long)((u64)base * (u64)pct / 100);
+}
+
 void aa_ns_acct_init(struct aa_ns *ns)
 {
 	struct aa_ns_acct *acct = &ns->acct;
@@ -361,6 +372,85 @@ int aa_ns_admit_count(struct aa_ns *ns, struct aa_ns_caps *limits, long delta)
 }
 
 /**
+ * aa_ns_admit_load_set - admit a whole replace set against @ns's caps
+ * @ns: target namespace
+ * @lh: the load set, a list of struct aa_load_ent
+ * @limits: the tentative caps the set is admitted against
+ * @udata: the load's raw data (for the retained-rawdata memory term)
+ * @fail_ent: out - the profile that broke a per-profile cap, or NULL for a
+ *	      whole-set (memory/count) breach; only set when denying
+ * @info: out - audit cause string; only set when denying
+ *
+ * Sum the set's net resident bytes and profile count (new minus the dedup-
+ * skipped and replaced old), plus any newly retained rawdata, and check the
+ * per-profile, memory and count caps, so a breach rejects the set atomically
+ * before anything installs. Null profiles count for memory but not the count.
+ *
+ * Requires: @ns->lock held.
+ *
+ * Returns: 0 to admit the set, or a negative errno with *fail_ent and *info set.
+ */
+int aa_ns_admit_load_set(struct aa_ns *ns, struct list_head *lh,
+			 struct aa_ns_caps *limits, struct aa_loaddata *udata,
+			 struct aa_load_ent **fail_ent, const char **info)
+{
+	long new_bytes = 0, old_bytes = 0;
+	long new_count = 0, old_count = 0;
+	struct aa_load_ent *ent;
+	int error;
+
+	if (!aa_g_policy_ns_quota)
+		return 0;
+
+	list_for_each_entry(ent, lh, list) {
+		long bytes;
+
+		if (ent->old && ent->new->rawdata &&
+		    ent->old->rawdata == ent->new->rawdata)
+			continue;	/* dedup-skipped at install */
+
+		bytes = ent->new->resident_size;
+		if (!(ent->new->label.flags & FLAG_NULL)) {
+			error = aa_ns_admit_profile_size(ns, limits, bytes);
+			if (error) {
+				*fail_ent = ent;
+				*info = "profile exceeds max_profile cap";
+				return error;
+			}
+			new_count++;
+		}
+		new_bytes += bytes;
+		if (ent->old) {
+			/* credit the exact bytes charged at @old's go-live,
+			 * matching the eventual uncharge
+			 */
+			old_bytes += ent->old->acct_resident;
+			if (!(ent->old->label.flags & FLAG_NULL))
+				old_count++;
+		}
+	}
+	/* a newly retained rawdata blob is charged too (same condition as
+	 * the __aa_fs_create_rawdata call in aa_replace_profiles)
+	 */
+	if (!udata->dents[AAFS_LOADDATA_DIR] && aa_g_export_binary)
+		new_bytes += aa_loaddata_resident_size(udata);
+
+	error = aa_ns_admit_resident(ns, limits, new_bytes - old_bytes);
+	if (error) {
+		*fail_ent = NULL;	/* whole-set breach, not one profile */
+		*info = "namespace memory cap exceeded";
+		return error;
+	}
+	error = aa_ns_admit_count(ns, limits, new_count - old_count);
+	if (error) {
+		*fail_ent = NULL;
+		*info = "namespace profile cap exceeded";
+		return error;
+	}
+	return 0;
+}
+
+/**
  * aa_ns_charge_profile - charge a profile's resident policy to its ns
  * @profile: the profile being made live  (NOT NULL)
  *
@@ -431,15 +521,22 @@ void aa_ns_uncharge_profile(struct aa_profile *profile)
  * @tighten: cap_min() against the existing value (self) vs overwrite (children)
  */
 static void apply_budget_keys(struct aa_ns_caps *dst, struct aa_ns_budget *b,
-			      bool tighten)
+			      bool tighten, const struct aa_ns_caps *pct_base)
 {
 	long *cap = (long *)dst;
 	int k;
 
 	for (k = 0; k < AA_POLICYNS_KEY_MAX; k++) {
-		if (!(b->specified & (1u << k)) || (b->percent & (1u << k)))
+		long v;
+
+		if (!(b->specified & (1u << k)))
 			continue;
-		cap[k] = tighten ? cap_min(cap[k], b->values[k]) : b->values[k];
+		if (b->percent & (1u << k))
+			/* N% of the parent's own cap for key @k */
+			v = cap_percent(((const long *)pct_base)[k], b->values[k]);
+		else
+			v = b->values[k];
+		cap[k] = tighten ? cap_min(cap[k], v) : v;
 	}
 }
 
@@ -449,19 +546,28 @@ static void apply_budget_keys(struct aa_ns_caps *dst, struct aa_ns_budget *b,
  * @child: the (tentative) children template of that namespace
  * @b: one parsed budget block
  */
-void aa_ns_apply_budget(struct aa_ns_caps *limits, struct aa_ns_caps *child,
-			struct aa_ns_budget *b)
+int aa_ns_apply_budget(struct aa_ns_caps *limits, struct aa_ns_caps *child,
+		       struct aa_ns_budget *b)
 {
+	/* Some features remains to be implemented and are rejected with -EOPNOTSUPP. */
+	if (b->scope == AA_POLICYNS_SCOPE_SUBTREE)
+		return -EOPNOTSUPP;
+	if (b->specified & ((1u << AA_POLICYNS_KEY_CRIU) |
+			    (1u << AA_POLICYNS_KEY_LOAD_RATE)))
+		return -EOPNOTSUPP;
+
 	switch (b->target) {
 	case AA_POLICYNS_TGT_SELF:
-		apply_budget_keys(limits, b, true);
-		break;
+		if (b->percent)		/* % is a per-child ratio only */
+			return -EOPNOTSUPP;
+		apply_budget_keys(limits, b, true, NULL);
+		return 0;
 	case AA_POLICYNS_TGT_CHILDREN:
 		aa_ns_caps_init_unset(child);
-		apply_budget_keys(child, b, false);
-		break;
-	default:
-		break;
+		apply_budget_keys(child, b, false, limits);
+		return 0;
+	default:	/* descendants/root/:NAME: not yet enforced */
+		return -EOPNOTSUPP;
 	}
 }
 
