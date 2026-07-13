@@ -1404,6 +1404,12 @@ static struct aa_profile *unpack_profile(struct aa_ext *e, char **ns_name)
 
 	aa_compute_profile_mediates(profile);
 
+	/*
+	 * Precompute the resident byte footprint once here, to reuse it on load
+	 * avoiding re-walking the whole profile.
+	 */
+	profile->resident_size = (long)aa_profile_resident_size(profile);
+
 	return profile;
 
 fail:

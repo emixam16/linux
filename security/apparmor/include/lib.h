@@ -161,6 +161,7 @@ struct aa_str_table {
 
 bool aa_resize_str_table(struct aa_str_table *t, int newsize, gfp_t gfp);
 void aa_destroy_str_table(struct aa_str_table *table);
+size_t aa_str_table_size(struct aa_str_table *table);
 
 struct counted_str {
 	struct kref count;

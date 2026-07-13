@@ -128,6 +128,16 @@ struct aa_loaddata {
 	char *data;
 };
 
+/*
+ * Resident byte footprint of a retained rawdata blob, charged to the owning
+ * ns while the blob is on ns->rawdata_list.
+ */
+static inline size_t aa_loaddata_resident_size(struct aa_loaddata *data)
+{
+	return sizeof(*data) +
+	       (data->compressed_size ? data->compressed_size : data->size);
+}
+
 int aa_unpack(struct aa_loaddata *udata, struct list_head *lh, const char **ns);
 
 /**
