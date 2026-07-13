@@ -245,6 +245,8 @@ static void __add_profile(struct list_head *list, struct aa_profile *profile)
 	l = aa_label_insert(&profile->ns->labels, &profile->label);
 	AA_BUG(l != &profile->label);
 	aa_put_label(l);
+	/* charge resident policy to the namespace as the profile goes live */
+	aa_ns_charge_profile(profile);
 }
 
 /**
@@ -265,6 +267,8 @@ static void __list_remove_profile(struct aa_profile *profile)
 	AA_BUG(!profile->ns);
 	AA_BUG(!mutex_is_locked(&profile->ns->lock));
 
+	/* release the namespace resident charge as the profile goes dead */
+	aa_ns_uncharge_profile(profile);
 	list_del_rcu(&profile->base.list);
 	aa_put_profile(profile);
 }
@@ -408,6 +412,9 @@ void aa_free_profile(struct aa_profile *profile)
 
 	if (!profile)
 		return;
+
+	/* Resident policy must already be uncharged */
+	AA_BUG(profile->acct_resident);
 
 	/* free children profiles */
 	aa_policy_destroy(&profile->base);
@@ -1172,10 +1179,16 @@ static void __replace_profile(struct aa_profile *old, struct aa_profile *new)
 	if (list_empty(&new->base.list)) {
 		/* new is not on a list already */
 		list_replace_rcu(&old->base.list, &new->base.list);
+		/* @new goes live in place of @old: swap their ns charges */
+		aa_ns_charge_profile(new);
+		aa_ns_uncharge_profile(old);
 		aa_get_profile(new);
 		aa_put_profile(old);
-	} else
+	} else {
+		/* @new is already on a list. Charge it if needed, then drop @old. */
+		aa_ns_charge_profile(new);
 		__list_remove_profile(old);
+	}
 }
 
 /**

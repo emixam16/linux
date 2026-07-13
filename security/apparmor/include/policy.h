@@ -177,6 +177,100 @@ struct aa_data {
 	struct rhash_head head;
 };
 
+#define AA_NS_NOLIMIT (-1L)
+
+/* struct aa_ns_caps - standing resource caps for a policy namespace
+ * @memory: max resident policy bytes for the namespace
+ * @max_profile: max resident bytes for any single profile loaded into the ns
+ * @profiles: max number of (non-null) profiles in the namespace
+ * @namespaces: max number of direct child namespaces
+ * @depth: max relative nesting depth permitted below the namespace
+ * @criu: max criu reserve bytes
+ * @load_rate: max load/replace ops per minute
+ *
+ * Each field is a maximum (implicit <=).
+ * AA_NS_NOLIMIT (-1) means unlimited and  0 means deny.
+ * Size caps are bytes, count caps are objects.
+ */
+struct aa_ns_caps {
+	long memory;
+	long max_profile;
+	long profiles;
+	long namespaces;
+	long depth;
+	long criu;
+	long load_rate;
+};
+
+
+/*
+ * Wire encoding of a "policyns limits" block. These constants are wire ABI
+ * and MUST match parser/policyns.h;
+ */
+#define AA_POLICYNS_TGT_SELF		0
+#define AA_POLICYNS_TGT_CHILDREN	1
+#define AA_POLICYNS_TGT_DESCENDANTS	2
+#define AA_POLICYNS_TGT_ROOT		3
+#define AA_POLICYNS_TGT_NAME		4
+
+#define AA_POLICYNS_SCOPE_UNSPEC	0
+#define AA_POLICYNS_SCOPE_LOCAL		1
+#define AA_POLICYNS_SCOPE_SUBTREE	2
+
+enum aa_policyns_key {
+	AA_POLICYNS_KEY_MEMORY,
+	AA_POLICYNS_KEY_MAX_PROFILE,
+	AA_POLICYNS_KEY_PROFILES,
+	AA_POLICYNS_KEY_NAMESPACES,
+	AA_POLICYNS_KEY_DEPTH,
+	AA_POLICYNS_KEY_CRIU,
+	AA_POLICYNS_KEY_LOAD_RATE,
+	AA_POLICYNS_KEY_MAX		/* wire value-array length */
+};
+
+#define AA_POLICYNS_KEY_ASSERT(key, field)				\
+	static_assert(offsetof(struct aa_ns_caps, field) ==		\
+		      (key) * sizeof(long),				\
+		      "aa_ns_caps." #field " must sit at wire key " #key)
+AA_POLICYNS_KEY_ASSERT(AA_POLICYNS_KEY_MEMORY, memory);
+AA_POLICYNS_KEY_ASSERT(AA_POLICYNS_KEY_MAX_PROFILE, max_profile);
+AA_POLICYNS_KEY_ASSERT(AA_POLICYNS_KEY_PROFILES, profiles);
+AA_POLICYNS_KEY_ASSERT(AA_POLICYNS_KEY_NAMESPACES, namespaces);
+AA_POLICYNS_KEY_ASSERT(AA_POLICYNS_KEY_DEPTH, depth);
+AA_POLICYNS_KEY_ASSERT(AA_POLICYNS_KEY_CRIU, criu);
+AA_POLICYNS_KEY_ASSERT(AA_POLICYNS_KEY_LOAD_RATE, load_rate);
+#undef AA_POLICYNS_KEY_ASSERT
+/* no padding/extra fields: the whole struct is exactly the keyed longs */
+static_assert(sizeof(struct aa_ns_caps) ==
+	      AA_POLICYNS_KEY_MAX * sizeof(long));
+
+/* initialise every cap to unset; key-driven so no field can be missed */
+static inline void aa_ns_caps_init_unset(struct aa_ns_caps *c)
+{
+	long *cap = (long *)c;
+	int k;
+
+	for (k = 0; k < AA_POLICYNS_KEY_MAX; k++)
+		cap[k] = AA_NS_NOLIMIT;
+}
+
+/* struct aa_ns_budget - one parsed "policyns limits" block from a profile
+ * @target: which namespace the block addresses (AA_POLICYNS_TGT_*)
+ * @scope: local/subtree accounting scope (AA_POLICYNS_SCOPE_*)
+ * @specified: bitmask of keys present (bit k == key k)
+ * @percent: bitmask of keys whose value is a percentage of the parent
+ * @values: cap values by key, valid only where @specified has the bit set
+ * @name: literal ns name for AA_POLICYNS_TGT_NAME (owned), else NULL
+ */
+struct aa_ns_budget {
+	u32 target;
+	u32 scope;
+	u32 specified;
+	u32 percent;
+	long values[AA_POLICYNS_KEY_MAX];
+	char *name;
+};
+
 /* struct aa_ruleset - data covering mediation rules
  * @list: list the rule is on
  * @policy: general match rules governing policy
@@ -274,7 +368,11 @@ struct aa_profile {
 
 	int n_rules;
 
+	long acct_resident;
 	long resident_size;
+
+	struct aa_ns_budget *budgets;
+	int n_budgets;
 
 	/* special - variable length must be last entry in profile */
 	struct aa_label label;
