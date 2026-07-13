@@ -1512,6 +1512,7 @@ void __aa_fs_remove_rawdata(struct aa_loaddata *rawdata)
 	if (rawdata->ns) {
 		remove_rawdata_dents(rawdata);
 		list_del_init(&rawdata->list);
+		aa_ns_uncharge_rawdata(rawdata->ns, rawdata);
 		aa_put_ns(rawdata->ns);
 		rawdata->ns = NULL;
 	}
@@ -1579,6 +1580,8 @@ int __aa_fs_create_rawdata(struct aa_ns *ns, struct aa_loaddata *rawdata)
 
 	rawdata->ns = aa_get_ns(ns);
 	list_add(&rawdata->list, &ns->rawdata_list);
+	/* retained rawdata is resident policy; charged while on the list */
+	aa_ns_charge_rawdata(ns, rawdata);
 
 	return 0;
 

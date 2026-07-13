@@ -12,26 +12,37 @@
 #define __AA_NAMESPACE_H
 
 #include <linux/kref.h>
+#include <linux/ratelimit.h>
 
 #include "apparmor.h"
 #include "apparmorfs.h"
 #include "label.h"
 #include "policy.h"
 
+struct apparmor_audit_data;
+
 /* Match max depth of user namespaces */
 #define MAX_NS_DEPTH 32
 
-/* struct aa_ns_acct - accounting of profiles in namespace
- * @max_size: maximum space allowed for all profiles in namespace
- * @max_count: maximum number of profiles that can be in this namespace
- * @size: current size of profiles
- * @count: current count of profiles (includes null profiles)
+/* default per-ns audit ratelimit for OP_NS_QUOTA emission */
+#define AA_NS_QUOTA_RATELIMIT_INTERVAL	(5 * HZ)
+#define AA_NS_QUOTA_RATELIMIT_BURST	10
+
+/* struct aa_ns_acct - per-namespace resource accounting and caps
+ * @limits: caps enforced against this namespace (self)
+ * @child: template caps stamped onto namespaces this namespace creates (children)
+ * @resident: current resident policy bytes charged to this ns (local scope)
+ * @profile_count: current count of non-null profiles in this ns (local)
+ * @ns_count: current number of direct child namespaces
+ * @ratelimit: bounds OP_NS_QUOTA audit emission
  */
 struct aa_ns_acct {
-	int max_size;
-	int max_count;
-	int size;
-	int count;
+	struct aa_ns_caps limits;
+	struct aa_ns_caps child;
+	atomic_long_t resident;
+	atomic_long_t profile_count;
+	atomic_long_t ns_count;
+	struct ratelimit_state ratelimit;
 };
 
 /* struct aa_ns - namespace for a set of profiles
@@ -95,6 +106,15 @@ struct aa_ns *__aa_find_or_create_ns(struct aa_ns *parent, const char *name,
 				     struct dentry *dir);
 struct aa_ns *aa_prepare_ns(struct aa_ns *root, const char *name);
 void __aa_remove_ns(struct aa_ns *ns);
+
+/* policy-namespace resource accounting (see policy-ns quota feature) */
+struct aa_loaddata;
+void aa_ns_acct_init(struct aa_ns *ns);
+void aa_ns_charge_profile(struct aa_profile *profile);
+void aa_ns_uncharge_profile(struct aa_profile *profile);
+/* retained rawdata accounting, at the ns->rawdata_list add/remove points */
+void aa_ns_charge_rawdata(struct aa_ns *ns, struct aa_loaddata *data);
+void aa_ns_uncharge_rawdata(struct aa_ns *ns, struct aa_loaddata *data);
 
 static inline struct aa_profile *aa_deref_parent(struct aa_profile *p)
 {
