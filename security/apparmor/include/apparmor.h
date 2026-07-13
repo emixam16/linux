@@ -35,6 +35,7 @@
 #define AA_CLASS_DISPLAY_LSM	20
 #define AA_CLASS_NS		21
 #define AA_CLASS_IO_URING	22
+#define AA_CLASS_POLICY_NS	23
 
 #define AA_CLASS_X		31
 #define AA_CLASS_DBUS		32
@@ -52,6 +53,7 @@ extern int aa_g_rawdata_compression_level;
 extern bool aa_g_lock_policy;
 extern bool aa_g_logsyscall;
 extern bool aa_g_paranoid_load;
+extern int aa_g_policy_ns_quota;
 extern unsigned int aa_g_path_max;
 
 #ifdef CONFIG_SECURITY_APPARMOR_EXPORT_BINARY

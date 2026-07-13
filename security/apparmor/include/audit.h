@@ -105,6 +105,8 @@ enum audit_type {
 
 #define OP_USERNS_CREATE "userns_create"
 
+#define OP_NS_QUOTA "ns_quota"
+
 #define OP_URING_OVERRIDE "uring_override"
 #define OP_URING_SQPOLL "uring_sqpoll"
 
@@ -153,6 +155,9 @@ struct apparmor_audit_data {
 			struct aa_profile *profile;
 			const char *ns;
 			long pos;
+			const char *limit;	/* name of the exceeded cap */
+			long requested;		/* what the operation asked for */
+			long available;		/* headroom remaining under the cap */
 		} iface;
 		struct {
 			const char *src_name;

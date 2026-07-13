@@ -1890,6 +1890,12 @@ module_param_named(path_max, aa_g_path_max, aauint, S_IRUSR);
 bool aa_g_paranoid_load = IS_ENABLED(CONFIG_SECURITY_APPARMOR_PARANOID_LOAD);
 module_param_named(paranoid_load, aa_g_paranoid_load, aabool, S_IRUGO);
 
+/* Policyns resource quota enforcement.
+ * Default on so a configured children/:NAME: cap binds out of the box.
+ * With no cap configured nothing is limited.
+ */
+int aa_g_policy_ns_quota = 1;
+
 static int param_get_aaintbool(char *buffer, const struct kernel_param *kp);
 static int param_set_aaintbool(const char *val, const struct kernel_param *kp);
 #define param_check_aaintbool param_check_int
@@ -2332,6 +2338,24 @@ static int apparmor_dointvec(const struct ctl_table *table, int write,
 	return proc_dointvec(table, write, buffer, lenp, ppos);
 }
 
+/*
+ * The quota knob constrains admins of child policy namespaces, so admin
+ * over the caller's own ns is not enough: a confined-but-root container
+ * manager could flip it and lift its own caps. Require admin over the
+ * root ns, which a task confined to a child ns can never hold.
+ */
+static int apparmor_dointvec_root_admin(const struct ctl_table *table,
+					int write, void *buffer,
+					size_t *lenp, loff_t *ppos)
+{
+	if (!aa_current_policy_admin_capable(root_ns))
+		return -EPERM;
+	if (!apparmor_enabled)
+		return -EINVAL;
+
+	return proc_dointvec(table, write, buffer, lenp, ppos);
+}
+
 static const struct ctl_table apparmor_sysctl_table[] = {
 #ifdef CONFIG_USER_NS
 	{
@@ -2355,6 +2379,13 @@ static const struct ctl_table apparmor_sysctl_table[] = {
 		.maxlen         = sizeof(int),
 		.mode           = 0600,
 		.proc_handler   = apparmor_dointvec,
+	},
+	{
+		.procname       = "apparmor_policy_ns_quota",
+		.data           = &aa_g_policy_ns_quota,
+		.maxlen         = sizeof(int),
+		.mode           = 0600,
+		.proc_handler   = apparmor_dointvec_root_admin,
 	},
 };
 
