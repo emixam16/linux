@@ -510,7 +510,8 @@ static inline bool ANY_RULE_MEDIATES(struct aa_profile *profile,
 }
 
 /* set of rules that are mediated by unconfined */
-static int unconfined_mediates[] = { AA_CLASS_NS, AA_CLASS_IO_URING, 0 };
+static int unconfined_mediates[] = { AA_CLASS_NS, AA_CLASS_IO_URING,
+				     AA_CLASS_POLICY_NS, 0 };
 
 /* must be called after profile rulesets and start information is setup */
 void aa_compute_profile_mediates(struct aa_profile *profile)
