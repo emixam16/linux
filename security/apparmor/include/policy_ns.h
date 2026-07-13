@@ -115,6 +115,18 @@ void aa_ns_uncharge_profile(struct aa_profile *profile);
 /* retained rawdata accounting, at the ns->rawdata_list add/remove points */
 void aa_ns_charge_rawdata(struct aa_ns *ns, struct aa_loaddata *data);
 void aa_ns_uncharge_rawdata(struct aa_ns *ns, struct aa_loaddata *data);
+/* structural admission, under parent->lock */
+int aa_ns_admit_create(struct aa_ns *parent);
+/* memory admission, pre-commit under ns->lock */
+int aa_ns_admit_resident(struct aa_ns *ns, struct aa_ns_caps *limits,
+			 long delta);
+/* per-profile and count admission, under ns->lock */
+int aa_ns_admit_profile_size(struct aa_ns *ns, struct aa_ns_caps *limits,
+			     long bytes);
+int aa_ns_admit_count(struct aa_ns *ns, struct aa_ns_caps *limits, long delta);
+/* apply one parsed "policyns limits" block to a (tentative) caps pair */
+void aa_ns_apply_budget(struct aa_ns_caps *limits, struct aa_ns_caps *child,
+			struct aa_ns_budget *budget);
 
 static inline struct aa_profile *aa_deref_parent(struct aa_profile *p)
 {
