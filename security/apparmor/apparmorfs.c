@@ -1460,6 +1460,47 @@ SEQ_NS_FOPS(name);
 SEQ_NS_FOPS(compress_min);
 SEQ_NS_FOPS(compress_max);
 
+/*
+ * Per-namespace resource accounting / cap introspection files. Unlike the
+ * files above (which report the current task's ns), these report the ns
+ * owning the dentry. A cap of AA_NS_NOLIMIT is shown as "max".
+ */
+static void seq_ns_print_cap(struct seq_file *seq, long v)
+{
+	if (v == AA_NS_NOLIMIT)
+		seq_puts(seq, "max\n");
+	else
+		seq_printf(seq, "%ld\n", v);
+}
+
+/*
+ * Caps and counters are read under ns->lock, so each file is a consistent
+ * snapshot. Usage counters are >= 0, so they never print as "max".
+ */
+#define SEQ_NS_ACCT(NAME, EXPR)						\
+static int seq_ns_ ##NAME ##_show(struct seq_file *seq, void *v)	\
+{									\
+	struct aa_ns *ns = get_ns_common_ref(seq->private);		\
+									\
+	if (ns) {							\
+		mutex_lock_nested(&ns->lock, ns->level);		\
+		seq_ns_print_cap(seq, (EXPR));				\
+		mutex_unlock(&ns->lock);				\
+		aa_put_ns(ns);						\
+	}								\
+	return 0;							\
+}									\
+SEQ_NS_FOPS(NAME)
+
+SEQ_NS_ACCT(acct_count, atomic_long_read(&ns->acct.profile_count));
+SEQ_NS_ACCT(acct_size, atomic_long_read(&ns->acct.resident));
+SEQ_NS_ACCT(acct_max_count, ns->acct.limits.profiles);
+SEQ_NS_ACCT(acct_max_size, ns->acct.limits.memory);
+SEQ_NS_ACCT(acct_max_profile, ns->acct.limits.max_profile);
+SEQ_NS_ACCT(acct_namespaces, ns->acct.limits.namespaces);
+SEQ_NS_ACCT(acct_depth, ns->acct.limits.depth);
+SEQ_NS_ACCT(acct_criu, ns->acct.limits.criu);
+
 
 /* policy/raw_data/ * file ops */
 #ifdef CONFIG_SECURITY_APPARMOR_EXPORT_BINARY
@@ -2194,9 +2235,26 @@ void __aafs_ns_rmdir(struct aa_ns *ns)
 }
 
 /* assumes cleanup in caller */
+/* per-namespace resource accounting / cap introspection files (read-only) */
+static const struct aa_ns_acct_file {
+	const char *name;
+	const struct file_operations *fops;
+	enum aafs_ns_type slot;
+} aa_ns_acct_files[] = {
+	{ ".count",	  &seq_ns_acct_count_fops,	AAFS_NS_COUNT },
+	{ ".max_count",	  &seq_ns_acct_max_count_fops,	AAFS_NS_MAX_COUNT },
+	{ ".size",	  &seq_ns_acct_size_fops,	AAFS_NS_SIZE },
+	{ ".max_size",	  &seq_ns_acct_max_size_fops,	AAFS_NS_MAX_SIZE },
+	{ ".max_profile", &seq_ns_acct_max_profile_fops, AAFS_NS_MAX_PROFILE },
+	{ ".namespaces",  &seq_ns_acct_namespaces_fops,	AAFS_NS_NAMESPACES },
+	{ ".depth",	  &seq_ns_acct_depth_fops,	AAFS_NS_DEPTH },
+	{ ".criu",	  &seq_ns_acct_criu_fops,	AAFS_NS_CRIU },
+};
+
 static int __aafs_ns_mkdir_entries(struct aa_ns *ns, struct dentry *dir)
 {
 	struct dentry *dent;
+	int i;
 
 	AA_BUG(!ns);
 	AA_BUG(!dir);
@@ -2238,6 +2296,16 @@ static int __aafs_ns_mkdir_entries(struct aa_ns *ns, struct dentry *dir)
 	if (IS_ERR(dent))
 		return PTR_ERR(dent);
 	ns_subremove(ns) = dent;
+
+	/* per-namespace resource accounting and cap introspection files */
+	for (i = 0; i < ARRAY_SIZE(aa_ns_acct_files); i++) {
+		dent = aafs_create_file(aa_ns_acct_files[i].name, 0444, dir,
+					&ns->unconfined->label.count,
+					aa_ns_acct_files[i].fops);
+		if (IS_ERR(dent))
+			return PTR_ERR(dent);
+		ns->dents[aa_ns_acct_files[i].slot] = dent;
+	}
 
 	  /* use create_dentry so we can supply private data */
 	dent = aafs_create("namespaces", S_IFDIR | 0755, dir,
@@ -2597,6 +2665,17 @@ static struct aa_sfs_entry aa_sfs_entry_versions[] = {
 };
 
 #define PERMS32STR "allow deny subtree cond kill complain prompt audit quiet hide xindex tag label"
+static struct aa_sfs_entry aa_sfs_entry_ns_quota[] = {
+	/*
+	 * Space-separated list of the policyns constructs this kernel
+	 * enforces, so userspace emits a construct only when it is present.
+	 * Each follow-up that starts enforcing a construct appends its token
+	 * (subtree, criu, load_rate, descendants, root, name, mediation).
+	 */
+	AA_SFS_FILE_STRING("mask", "self children percent local"),
+	{ }
+};
+
 static struct aa_sfs_entry aa_sfs_entry_policy[] = {
 	AA_SFS_DIR("versions",			aa_sfs_entry_versions),
 	AA_SFS_FILE_BOOLEAN("set_load",		1),
@@ -2609,6 +2688,8 @@ static struct aa_sfs_entry aa_sfs_entry_policy[] = {
 	AA_SFS_DIR("unconfined_restrictions",   aa_sfs_entry_unconfined),
 	AA_SFS_FILE_BOOLEAN("compressed_load",	1),
 	AA_SFS_FILE_BOOLEAN("extended_policy_header",	1),
+	/* policy-namespace resource controls (quota) */
+	AA_SFS_DIR("ns_quota",			aa_sfs_entry_ns_quota),
 	{ }
 };
 
@@ -2920,6 +3001,20 @@ int __init aa_create_aafs(void)
 	if (IS_ERR(dent))
 		goto dent_error;
 	ns_subrevision(root_ns) = dent;
+
+	/*
+	 * Root ns accounting / cap files at the top level next to .load;
+	 * child namespaces get theirs via __aafs_ns_mkdir_entries().
+	 */
+	for (int i = 0; i < ARRAY_SIZE(aa_ns_acct_files); i++) {
+		dent = securityfs_create_file(aa_ns_acct_files[i].name, 0444,
+					      aa_sfs_entry.dentry,
+					      &root_ns->unconfined->label.count,
+					      aa_ns_acct_files[i].fops);
+		if (IS_ERR(dent))
+			goto dent_error;
+		root_ns->dents[aa_ns_acct_files[i].slot] = dent;
+	}
 
 	/* policy tree referenced by magic policy symlink */
 	mutex_lock_nested(&root_ns->lock, root_ns->level);
