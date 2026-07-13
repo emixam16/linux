@@ -433,6 +433,10 @@ void aa_free_profile(struct aa_profile *profile)
 	for (int i = 0; i < profile->n_rules; i++)
 		free_ruleset(profile->label.rules[i]);
 
+	for (int i = 0; i < profile->n_budgets; i++)
+		kfree(profile->budgets[i].name);
+	kfree(profile->budgets);
+
 	kfree_sensitive(profile->dirname);
 
 	if (profile->data) {
@@ -1268,6 +1272,7 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 	struct aa_ns *ns = NULL;
 	struct aa_load_ent *ent, *tmp;
 	struct aa_loaddata *rawdata_ent;
+	struct aa_ns_caps pend_limits, pend_child;
 	const char *op;
 	ssize_t count, error;
 	LIST_HEAD(lh);
@@ -1319,6 +1324,9 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 		ns = aa_get_ns(policy_ns ? policy_ns : labels_ns(label));
 
 	mutex_lock_nested(&ns->lock, ns->level);
+	/* Tentative copies of the ns caps */
+	pend_limits = ns->acct.limits;
+	pend_child = ns->acct.child;
 	/* check for duplicate rawdata blobs: space and file dedup */
 	if (!list_empty(&ns->rawdata_list)) {
 		list_for_each_entry(rawdata_ent, &ns->rawdata_list, list) {
@@ -1401,6 +1409,38 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 		rcu_assign_pointer(ent->new->parent, aa_get_profile(p));
 	}
 
+	/*
+	 * Apply the load's "policyns limits" blocks to the tentative caps
+	 * before admission.
+	 */
+	if (aa_g_policy_ns_quota) {
+		list_for_each_entry(ent, &lh, list) {
+			int b;
+
+			for (b = 0; b < ent->new->n_budgets; b++)
+				aa_ns_apply_budget(&pend_limits, &pend_child,
+						   &ent->new->budgets[b]);
+		}
+	} else {
+		list_for_each_entry(ent, &lh, list) {
+			if (ent->new->n_budgets) {
+				audit_policy(label, op, ns_name,
+					     ent->new->base.hname,
+					     "policyns limits ignored: ns_quota disabled",
+					     0);
+				break;	/* one record per load set */
+			}
+		}
+	}
+
+	/*
+	 * Admission: check the whole load set against the tentative caps
+	 * before installing anything, so a breach rejects the set atomically.
+	 */
+	error = aa_ns_admit_load_set(ns, &lh, &pend_limits, udata, &ent, &info);
+	if (error)
+		goto fail_lock;
+
 	/* create new fs entries for introspection if needed */
 	if (!udata->dents[AAFS_LOADDATA_DIR] && aa_g_export_binary) {
 		error = __aa_fs_create_rawdata(ns, udata);
@@ -1429,6 +1469,9 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 	}
 
 	/* Done with checks that may fail - do actual replacement */
+	/* commit the caps the load was admitted against */
+	ns->acct.limits = pend_limits;
+	ns->acct.child = pend_child;
 	__aa_bump_ns_revision(ns);
 	if (aa_g_export_binary)
 		__aa_loaddata_update(udata, ns->revision);

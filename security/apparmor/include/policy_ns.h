@@ -124,6 +124,11 @@ int aa_ns_admit_resident(struct aa_ns *ns, struct aa_ns_caps *limits,
 int aa_ns_admit_profile_size(struct aa_ns *ns, struct aa_ns_caps *limits,
 			     long bytes);
 int aa_ns_admit_count(struct aa_ns *ns, struct aa_ns_caps *limits, long delta);
+/* whole replace-set admission, under ns->lock */
+struct aa_load_ent;
+int aa_ns_admit_load_set(struct aa_ns *ns, struct list_head *lh,
+			 struct aa_ns_caps *limits, struct aa_loaddata *udata,
+			 struct aa_load_ent **fail_ent, const char **info);
 /* apply one parsed "policyns limits" block to a (tentative) caps pair */
 void aa_ns_apply_budget(struct aa_ns_caps *limits, struct aa_ns_caps *child,
 			struct aa_ns_budget *budget);
