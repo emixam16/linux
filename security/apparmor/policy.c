@@ -142,6 +142,84 @@ struct aa_policydb *aa_alloc_pdb(gfp_t gfp)
 	return pdb;
 }
 
+/**
+ * aa_pdb_size - resident byte footprint of a policydb
+ * @pdb: policydb to measure  (MAYBE NULL)
+ *
+ * Returns: bytes resident for @pdb
+ */
+size_t aa_pdb_size(struct aa_policydb *pdb)
+{
+	size_t size;
+
+	if (!pdb || pdb == nullpdb)
+		return 0;
+
+	size = sizeof(*pdb);
+	size += aa_dfa_size(pdb->dfa);
+	size += (size_t)pdb->size * sizeof(struct aa_perms);
+	size += aa_str_table_size(&pdb->trans);
+	size += (size_t)pdb->tags.hdrs.size * sizeof(struct aa_tags_header);
+	size += (size_t)pdb->tags.sets.size * sizeof(u32);
+	size += aa_str_table_size(&pdb->tags.strs);
+
+	return size;
+}
+
+/**
+ * aa_ruleset_resident_size - resident byte footprint of a ruleset
+ * @rules: ruleset to measure  (MAYBE NULL)
+ *
+ * Returns: bytes resident for @rules
+ */
+size_t aa_ruleset_resident_size(struct aa_ruleset *rules)
+{
+	size_t size;
+	int i;
+
+	if (!rules)
+		return 0;
+
+	size = sizeof(*rules);
+	size += aa_pdb_size(rules->policy);
+	/* file aliases policy when file rules are embedded in the policydb */
+	if (rules->file != rules->policy)
+		size += aa_pdb_size(rules->file);
+	size += (size_t)rules->secmark_count * sizeof(struct aa_secmark);
+	for (i = 0; i < rules->secmark_count; i++) {
+		if (rules->secmark[i].label)
+			size += strlen(rules->secmark[i].label) + 1;
+	}
+
+	return size;
+}
+
+/**
+ * aa_profile_resident_size - resident byte footprint of a profile's policy
+ * @profile: profile to measure  (MAYBE NULL)
+ *
+ * Returns: the standing (resident) byte cost of @profile's loaded policy
+ */
+size_t aa_profile_resident_size(struct aa_profile *profile)
+{
+	size_t size = 0;
+	int i;
+
+	if (!profile)
+		return 0;
+
+	for (i = 0; i < profile->n_rules; i++)
+		size += aa_ruleset_resident_size(profile->label.rules[i]);
+
+	size += aa_pdb_size(profile->attach.xmatch);
+	for (i = 0; i < profile->attach.xattr_count; i++) {
+		if (profile->attach.xattrs[i])
+			size += strlen(profile->attach.xattrs[i]) + 1;
+	}
+
+	return size;
+}
+
 
 /**
  * __add_profile - add a profiles to list and label tree
@@ -706,6 +784,8 @@ struct aa_profile *aa_alloc_null(struct aa_profile *parent, const char *name,
 	rules->file = aa_get_pdb(nullpdb);
 	rules->policy = aa_get_pdb(nullpdb);
 	aa_compute_profile_mediates(profile);
+	/* resident_size invariant: set at construction (as in unpack_profile) */
+	profile->resident_size = (long)aa_profile_resident_size(profile);
 
 	if (parent) {
 		profile->path_flags = parent->path_flags;

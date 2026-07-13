@@ -162,6 +162,27 @@ void aa_destroy_str_table(struct aa_str_table *t)
 }
 
 /**
+ * aa_str_table_size - resident byte footprint of a string table
+ * @t: the string table to measure  (MAYBE NULL)
+ *
+ * Returns: bytes resident for @t
+ */
+size_t aa_str_table_size(struct aa_str_table *t)
+{
+	size_t size;
+	int i;
+
+	if (!t || !t->table)
+		return 0;
+
+	size = (size_t)t->size * sizeof(struct aa_str_table_ent);
+	for (i = 0; i < t->size; i++)
+		size += t->table[i].size;
+
+	return size;
+}
+
+/**
  * skipn_spaces - Removes leading whitespace from @str.
  * @str: The string to be stripped.
  * @n: length of str to parse, will stop at \0 if encountered before n

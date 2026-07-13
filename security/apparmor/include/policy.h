@@ -273,6 +273,9 @@ struct aa_profile {
 	struct rhashtable *data;
 
 	int n_rules;
+
+	long resident_size;
+
 	/* special - variable length must be last entry in profile */
 	struct aa_label label;
 };
@@ -287,6 +290,9 @@ extern enum profile_mode aa_g_profile_mode;
 #define name_is_shared(A, B) ((A)->hname && (A)->hname == (B)->hname)
 
 struct aa_ruleset *aa_alloc_ruleset(gfp_t gfp);
+size_t aa_pdb_size(struct aa_policydb *pdb);
+size_t aa_ruleset_resident_size(struct aa_ruleset *rules);
+size_t aa_profile_resident_size(struct aa_profile *profile);
 struct aa_profile *aa_alloc_profile(const char *name, struct aa_proxy *proxy,
 				    gfp_t gfp);
 struct aa_profile *aa_alloc_null(struct aa_profile *parent, const char *name,
