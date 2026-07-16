@@ -210,6 +210,7 @@ static inline void aa_put_profile_loaddata(struct aa_loaddata *data)
 }
 
 #if IS_ENABLED(CONFIG_KUNIT)
+struct aa_ns_budget;
 bool aa_inbounds(struct aa_ext *e, size_t size);
 size_t aa_unpack_u16_chunk(struct aa_ext *e, char **chunk);
 bool aa_unpack_X(struct aa_ext *e, enum aa_code code);
@@ -220,6 +221,7 @@ bool aa_unpack_array(struct aa_ext *e, const char *name, u16 *size);
 size_t aa_unpack_blob(struct aa_ext *e, char **blob, const char *name);
 int aa_unpack_str(struct aa_ext *e, const char **string, const char *name);
 int aa_unpack_strdup(struct aa_ext *e, char **string, const char *name);
+int unpack_policyns_block(struct aa_ext *e, struct aa_ns_budget *b);
 #endif
 
 #endif /* __POLICY_INTERFACE_H */
