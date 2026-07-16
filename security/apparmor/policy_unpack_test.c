@@ -9,6 +9,8 @@
 #include "include/policy.h"
 #include "include/policy_unpack.h"
 
+#include <linux/limits.h>
+#include <linux/sizes.h>
 #include <linux/unaligned.h>
 
 #define TEST_STRING_NAME "TEST_STRING"
@@ -570,6 +572,416 @@ static void policy_unpack_test_unpack_X_out_of_bounds(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, success);
 }
 
+/*
+ * unpack_policyns_block() tests. The "policyns" struct is untrusted wire
+ * input, so each malformed shape must be rejected (-EPROTO) with e->pos
+ * restored, and only well-formed blocks may return 1.
+ *
+ * Blocks are built with a cursor-based emitter rather than the fixed-offset
+ * fixture above because the wire struct nests and most tests need a slightly
+ * different shape.
+ */
+
+#define PN_BLOB_SIZE 512
+
+struct pn_blob {
+	struct aa_ext e;
+	char *pos;
+};
+
+static struct pn_blob *pn_blob_alloc(struct kunit *test)
+{
+	struct pn_blob *b;
+
+	b = kunit_kmalloc(test, sizeof(*b), GFP_USER);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, b);
+	b->e.start = kunit_kzalloc(test, PN_BLOB_SIZE, GFP_USER);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, b->e.start);
+	b->e.pos = b->e.start;
+	b->pos = b->e.start;
+	/* e.end is finalized to the written length by pn_blob_seal() */
+	b->e.end = b->e.start + PN_BLOB_SIZE;
+	return b;
+}
+
+static void pn_put_bytes(struct kunit *test, struct pn_blob *b,
+			 const void *data, size_t len)
+{
+	KUNIT_ASSERT_TRUE(test, b->pos + len <= (char *)b->e.end);
+	memcpy(b->pos, data, len);
+	b->pos += len;
+}
+
+static void pn_put_code(struct kunit *test, struct pn_blob *b,
+			enum aa_code code)
+{
+	char c = code;
+
+	pn_put_bytes(test, b, &c, 1);
+}
+
+/* u16 length-prefixed chunk of exactly @len bytes of @s (no implicit NUL) */
+static void pn_put_chunk_raw(struct kunit *test, struct pn_blob *b,
+			     const char *s, u16 len)
+{
+	KUNIT_ASSERT_TRUE(test, b->pos + 2 <= (char *)b->e.end);
+	put_unaligned_le16(len, b->pos);
+	b->pos += 2;
+	pn_put_bytes(test, b, s, len);
+}
+
+/* u16 length-prefixed chunk: the encoding under AA_NAME and AA_STRING */
+static void pn_put_chunk(struct kunit *test, struct pn_blob *b, const char *s)
+{
+	pn_put_chunk_raw(test, b, s, strlen(s) + 1);
+}
+
+static void pn_put_name(struct kunit *test, struct pn_blob *b,
+			const char *name)
+{
+	pn_put_code(test, b, AA_NAME);
+	pn_put_chunk(test, b, name);
+}
+
+static void pn_put_u32(struct kunit *test, struct pn_blob *b, u32 v)
+{
+	pn_put_code(test, b, AA_U32);
+	KUNIT_ASSERT_TRUE(test, b->pos + 4 <= (char *)b->e.end);
+	put_unaligned_le32(v, b->pos);
+	b->pos += 4;
+}
+
+static void pn_put_u64(struct kunit *test, struct pn_blob *b, u64 v)
+{
+	pn_put_code(test, b, AA_U64);
+	KUNIT_ASSERT_TRUE(test, b->pos + 8 <= (char *)b->e.end);
+	put_unaligned_le64(v, b->pos);
+	b->pos += 8;
+}
+
+static void pn_put_array_hdr(struct kunit *test, struct pn_blob *b, u16 count)
+{
+	pn_put_code(test, b, AA_ARRAY);
+	KUNIT_ASSERT_TRUE(test, b->pos + 2 <= (char *)b->e.end);
+	put_unaligned_le16(count, b->pos);
+	b->pos += 2;
+}
+
+/* clamp e->end to what was actually written so overreads go out of bounds */
+static void pn_blob_seal(struct pn_blob *b)
+{
+	b->e.end = b->pos;
+}
+
+struct pn_block_shape {
+	u32 target;
+	u32 scope;
+	u32 specified;
+	u32 percent;
+	u16 array_count;	/* wire count field; values emitted to match */
+	u64 value0;		/* first array value; the rest are 0 */
+	const char *name;	/* trailing "name" string, or NULL */
+	bool structend;
+};
+
+#define PN_WELLFORMED_SHAPE {						\
+		.target = AA_POLICYNS_TGT_CHILDREN,			\
+		.scope = AA_POLICYNS_SCOPE_LOCAL,			\
+		.specified = BIT(AA_POLICYNS_KEY_MEMORY),		\
+		.array_count = AA_POLICYNS_KEY_MAX,			\
+		.value0 = SZ_1M,					\
+		.structend = true,					\
+	}
+
+static void pn_put_block(struct kunit *test, struct pn_blob *b,
+			 const struct pn_block_shape *s)
+{
+	int i;
+
+	pn_put_name(test, b, "policyns");
+	pn_put_code(test, b, AA_STRUCT);
+	pn_put_u32(test, b, s->target);
+	pn_put_u32(test, b, s->scope);
+	pn_put_u32(test, b, s->specified);
+	pn_put_u32(test, b, s->percent);
+	pn_put_array_hdr(test, b, s->array_count);
+	for (i = 0; i < s->array_count; i++)
+		pn_put_u64(test, b, i == 0 ? s->value0 : 0);
+	pn_put_code(test, b, AA_ARRAYEND);
+	if (s->name) {
+		pn_put_name(test, b, "name");
+		pn_put_code(test, b, AA_STRING);
+		pn_put_chunk(test, b, s->name);
+	}
+	if (s->structend)
+		pn_put_code(test, b, AA_STRUCTEND);
+}
+
+static void policy_unpack_test_policyns_wellformed(struct kunit *test)
+{
+	struct pn_block_shape s = PN_WELLFORMED_SHAPE;
+	struct pn_blob *b = pn_blob_alloc(test);
+	struct aa_ns_budget budget = {};
+	int k;
+
+	pn_put_block(test, b, &s);
+	pn_blob_seal(b);
+
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), 1);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.end);
+	KUNIT_EXPECT_EQ(test, budget.target, (u32)AA_POLICYNS_TGT_CHILDREN);
+	KUNIT_EXPECT_EQ(test, budget.scope, (u32)AA_POLICYNS_SCOPE_LOCAL);
+	KUNIT_EXPECT_EQ(test, budget.specified,
+			(u32)BIT(AA_POLICYNS_KEY_MEMORY));
+	KUNIT_EXPECT_EQ(test, budget.percent, (u32)0);
+	KUNIT_EXPECT_EQ(test, budget.values[AA_POLICYNS_KEY_MEMORY],
+			(long)SZ_1M);
+	for (k = AA_POLICYNS_KEY_MAX_PROFILE; k < AA_POLICYNS_KEY_MAX; k++)
+		KUNIT_EXPECT_EQ(test, budget.values[k], 0L);
+	KUNIT_EXPECT_NULL(test, budget.name);
+}
+
+static void policy_unpack_test_policyns_absent(struct kunit *test)
+{
+	struct pn_blob *b = pn_blob_alloc(test);
+	struct aa_ns_budget budget = {};
+
+	/* some other named u32, not a policyns struct */
+	pn_put_name(test, b, "notpolicyns");
+	pn_put_u32(test, b, 1);
+	pn_blob_seal(b);
+
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), 0);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.start);
+}
+
+static void policy_unpack_test_policyns_name_target(struct kunit *test)
+{
+	struct pn_block_shape s = PN_WELLFORMED_SHAPE;
+	struct pn_blob *b = pn_blob_alloc(test);
+	struct aa_ns_budget budget = {};
+
+	s.target = AA_POLICYNS_TGT_NAME;
+	s.name = "lxd-child";
+	pn_put_block(test, b, &s);
+	pn_blob_seal(b);
+
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), 1);
+	KUNIT_ASSERT_NOT_NULL(test, budget.name);
+	KUNIT_EXPECT_STREQ(test, budget.name, "lxd-child");
+	kfree(budget.name);
+}
+
+static void policy_unpack_test_policyns_name_missing(struct kunit *test)
+{
+	struct pn_block_shape s = PN_WELLFORMED_SHAPE;
+	struct pn_blob *b = pn_blob_alloc(test);
+	struct aa_ns_budget budget = {};
+
+	/* :NAME: target must carry the name string */
+	s.target = AA_POLICYNS_TGT_NAME;
+	pn_put_block(test, b, &s);
+	pn_blob_seal(b);
+
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), -EPROTO);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.start);
+}
+
+static void policy_unpack_test_policyns_unexpected_name(struct kunit *test)
+{
+	struct pn_block_shape s = PN_WELLFORMED_SHAPE;
+	struct pn_blob *b = pn_blob_alloc(test);
+	struct aa_ns_budget budget = {};
+
+	/* a name string on a non-:NAME: target must not parse */
+	s.name = "sneaky";
+	pn_put_block(test, b, &s);
+	pn_blob_seal(b);
+
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), -EPROTO);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.start);
+}
+
+static void policy_unpack_test_policyns_short_array(struct kunit *test)
+{
+	struct pn_block_shape s = PN_WELLFORMED_SHAPE;
+	struct pn_blob *b = pn_blob_alloc(test);
+	struct aa_ns_budget budget = {};
+
+	s.array_count = AA_POLICYNS_KEY_MAX - 1;
+	pn_put_block(test, b, &s);
+	pn_blob_seal(b);
+
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), -EPROTO);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.start);
+}
+
+static void policy_unpack_test_policyns_long_array(struct kunit *test)
+{
+	struct pn_block_shape s = PN_WELLFORMED_SHAPE;
+	struct pn_blob *b = pn_blob_alloc(test);
+	struct aa_ns_budget budget = {};
+
+	s.array_count = AA_POLICYNS_KEY_MAX + 1;
+	pn_put_block(test, b, &s);
+	pn_blob_seal(b);
+
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), -EPROTO);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.start);
+}
+
+static void policy_unpack_test_policyns_value_over_int_max(struct kunit *test)
+{
+	struct pn_block_shape s = PN_WELLFORMED_SHAPE;
+	struct pn_blob *b = pn_blob_alloc(test);
+	struct aa_ns_budget budget = {};
+
+	/* the parser bounds caps at INT_MAX; larger values are rejected */
+	s.value0 = (u64)INT_MAX + 1;
+	pn_put_block(test, b, &s);
+	pn_blob_seal(b);
+
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), -EPROTO);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.start);
+}
+
+static void policy_unpack_test_policyns_bad_bitmasks(struct kunit *test)
+{
+	struct pn_block_shape s = PN_WELLFORMED_SHAPE;
+	struct pn_blob *b = pn_blob_alloc(test);
+	struct aa_ns_budget budget = {};
+
+	s.specified = BIT(AA_POLICYNS_KEY_MAX);
+	pn_put_block(test, b, &s);
+	pn_blob_seal(b);
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), -EPROTO);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.start);
+
+	b = pn_blob_alloc(test);
+	s.specified = BIT(AA_POLICYNS_KEY_MEMORY);
+	s.percent = BIT(AA_POLICYNS_KEY_MAX);
+	pn_put_block(test, b, &s);
+	pn_blob_seal(b);
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), -EPROTO);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.start);
+}
+
+static void policy_unpack_test_policyns_bad_target_scope(struct kunit *test)
+{
+	struct pn_block_shape s = PN_WELLFORMED_SHAPE;
+	struct pn_blob *b = pn_blob_alloc(test);
+	struct aa_ns_budget budget = {};
+
+	/* a target past the last known value must be rejected */
+	s.target = AA_POLICYNS_TGT_NAME + 1;
+	pn_put_block(test, b, &s);
+	pn_blob_seal(b);
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), -EPROTO);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.start);
+
+	/* likewise a scope past the last known value */
+	b = pn_blob_alloc(test);
+	s.target = AA_POLICYNS_TGT_CHILDREN;
+	s.scope = AA_POLICYNS_SCOPE_SUBTREE + 1;
+	pn_put_block(test, b, &s);
+	pn_blob_seal(b);
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), -EPROTO);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.start);
+}
+
+static void policy_unpack_test_policyns_missing_structend(struct kunit *test)
+{
+	struct pn_block_shape s = PN_WELLFORMED_SHAPE;
+	struct pn_blob *b = pn_blob_alloc(test);
+	struct aa_ns_budget budget = {};
+
+	s.structend = false;
+	pn_put_block(test, b, &s);
+	pn_blob_seal(b);
+
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), -EPROTO);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.start);
+}
+
+static void policy_unpack_test_policyns_truncated(struct kunit *test)
+{
+	struct pn_blob *b = pn_blob_alloc(test);
+	struct aa_ns_budget budget = {};
+	char *array_start;
+
+	pn_put_name(test, b, "policyns");
+	pn_put_code(test, b, AA_STRUCT);
+	pn_put_u32(test, b, AA_POLICYNS_TGT_CHILDREN);
+	pn_put_u32(test, b, AA_POLICYNS_SCOPE_LOCAL);
+	pn_put_u32(test, b, BIT(AA_POLICYNS_KEY_MEMORY));
+	pn_put_u32(test, b, 0);
+	pn_put_array_hdr(test, b, AA_POLICYNS_KEY_MAX);
+	array_start = b->pos;
+	pn_put_u64(test, b, SZ_1M);
+	/* clip mid-way through the first value's payload */
+	b->e.end = array_start + 4;
+
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), -EPROTO);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.start);
+}
+
+static void policy_unpack_test_policyns_header_truncated(struct kunit *test)
+{
+	struct pn_blob *b = pn_blob_alloc(test);
+	struct aa_ns_budget budget = {};
+
+	/*
+	 * Truncation before the AA_STRUCT code reads as "no block here":
+	 * return 0, not -EPROTO. unpack_policyns() relies on 0 as its clean
+	 * loop-termination contract.
+	 */
+	pn_put_name(test, b, "policyns");
+	pn_blob_seal(b);
+
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), 0);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.start);
+}
+
+static void policy_unpack_test_policyns_unterminated_name(struct kunit *test)
+{
+	struct pn_block_shape s = PN_WELLFORMED_SHAPE;
+	struct pn_blob *b = pn_blob_alloc(test);
+	struct aa_ns_budget budget = {};
+
+	/* a :NAME: string chunk without the trailing NUL must be rejected */
+	s.target = AA_POLICYNS_TGT_NAME;
+	s.structend = false;
+	pn_put_block(test, b, &s);
+	pn_put_name(test, b, "name");
+	pn_put_code(test, b, AA_STRING);
+	pn_put_chunk_raw(test, b, "evil", 4);
+	pn_put_code(test, b, AA_STRUCTEND);
+	pn_blob_seal(b);
+
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), -EPROTO);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.start);
+}
+
+static void policy_unpack_test_policyns_sequential_blocks(struct kunit *test)
+{
+	struct pn_block_shape s = PN_WELLFORMED_SHAPE;
+	struct pn_blob *b = pn_blob_alloc(test);
+	struct aa_ns_budget budget = {};
+
+	/* two blocks back to back, as unpack_policyns() consumes them */
+	pn_put_block(test, b, &s);
+	s.target = AA_POLICYNS_TGT_SELF;
+	pn_put_block(test, b, &s);
+	pn_blob_seal(b);
+
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), 1);
+	KUNIT_EXPECT_EQ(test, budget.target, (u32)AA_POLICYNS_TGT_CHILDREN);
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), 1);
+	KUNIT_EXPECT_EQ(test, budget.target, (u32)AA_POLICYNS_TGT_SELF);
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), 0);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.end);
+}
+
 static struct kunit_case apparmor_policy_unpack_test_cases[] = {
 	KUNIT_CASE(policy_unpack_test_inbounds_when_inbounds),
 	KUNIT_CASE(policy_unpack_test_inbounds_when_out_of_bounds),
@@ -601,6 +1013,21 @@ static struct kunit_case apparmor_policy_unpack_test_cases[] = {
 	KUNIT_CASE(policy_unpack_test_unpack_X_code_match),
 	KUNIT_CASE(policy_unpack_test_unpack_X_code_mismatch),
 	KUNIT_CASE(policy_unpack_test_unpack_X_out_of_bounds),
+	KUNIT_CASE(policy_unpack_test_policyns_wellformed),
+	KUNIT_CASE(policy_unpack_test_policyns_absent),
+	KUNIT_CASE(policy_unpack_test_policyns_name_target),
+	KUNIT_CASE(policy_unpack_test_policyns_name_missing),
+	KUNIT_CASE(policy_unpack_test_policyns_unexpected_name),
+	KUNIT_CASE(policy_unpack_test_policyns_short_array),
+	KUNIT_CASE(policy_unpack_test_policyns_long_array),
+	KUNIT_CASE(policy_unpack_test_policyns_value_over_int_max),
+	KUNIT_CASE(policy_unpack_test_policyns_bad_bitmasks),
+	KUNIT_CASE(policy_unpack_test_policyns_bad_target_scope),
+	KUNIT_CASE(policy_unpack_test_policyns_missing_structend),
+	KUNIT_CASE(policy_unpack_test_policyns_truncated),
+	KUNIT_CASE(policy_unpack_test_policyns_header_truncated),
+	KUNIT_CASE(policy_unpack_test_policyns_unterminated_name),
+	KUNIT_CASE(policy_unpack_test_policyns_sequential_blocks),
 	{},
 };
 

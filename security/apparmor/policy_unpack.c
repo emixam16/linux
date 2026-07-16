@@ -635,7 +635,8 @@ fail:
  * Returns: 1 if a block was consumed, 0 if none is present, or a negative
  * errno on malformed input.
  */
-static int unpack_policyns_block(struct aa_ext *e, struct aa_ns_budget *b)
+VISIBLE_IF_KUNIT int unpack_policyns_block(struct aa_ext *e,
+					   struct aa_ns_budget *b)
 {
 	void *pos = e->pos;
 	char *name = NULL;
@@ -692,6 +693,7 @@ fail:
 	e->pos = pos;
 	return -EPROTO;
 }
+EXPORT_SYMBOL_IF_KUNIT(unpack_policyns_block);
 
 /*
  * unpack_policyns - collect a profile's "policyns limits" blocks onto it
