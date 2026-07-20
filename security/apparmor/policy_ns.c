@@ -210,6 +210,8 @@ void aa_ns_acct_init(struct aa_ns *ns)
 	atomic_long_set(&acct->resident, 0);
 	atomic_long_set(&acct->profile_count, 0);
 	atomic_long_set(&acct->ns_count, 0);
+	atomic_long_set(&acct->subtree_resident, 0);
+	atomic_long_set(&acct->subtree_profile_count, 0);
 	ratelimit_state_init(&acct->ratelimit,
 			     AA_NS_QUOTA_RATELIMIT_INTERVAL,
 			     AA_NS_QUOTA_RATELIMIT_BURST);
@@ -449,6 +451,24 @@ int aa_ns_admit_load_set(struct aa_ns *ns, struct list_head *lh,
 	return 0;
 }
 
+/*
+ * acct_rollup - add a usage delta to @ns's and every ancestor's subtree totals
+ * @ns: the namespace the delta was charged to  (NOT NULL)
+ * @bytes: resident byte delta (may be negative)
+ * @profiles: non-null profile count delta (may be negative)
+ *
+ * The parent chain is stable for the life of @ns (each ns holds a ref on its
+ * parent and is never reparented), so the lockless atomic walk is safe from
+ * any charge/uncharge context.
+ */
+static void acct_rollup(struct aa_ns *ns, long bytes, long profiles)
+{
+	for (; ns; ns = ns->parent) {
+		atomic_long_add(bytes, &ns->acct.subtree_resident);
+		atomic_long_add(profiles, &ns->acct.subtree_profile_count);
+	}
+}
+
 /**
  * aa_ns_charge_profile - charge a profile's resident policy to its ns
  * @profile: the profile being made live  (NOT NULL)
@@ -458,6 +478,7 @@ int aa_ns_admit_load_set(struct aa_ns *ns, struct list_head *lh,
 void aa_ns_charge_profile(struct aa_profile *profile)
 {
 	struct aa_ns *ns = profile->ns;
+	bool counted;
 	long bytes;
 
 	if (!ns || profile->acct_resident)
@@ -465,9 +486,11 @@ void aa_ns_charge_profile(struct aa_profile *profile)
 
 	bytes = profile->resident_size;
 	profile->acct_resident = bytes;
+	counted = !(profile->label.flags & FLAG_NULL);
 	atomic_long_add(bytes, &ns->acct.resident);
-	if (!(profile->label.flags & FLAG_NULL))
+	if (counted)
 		atomic_long_inc(&ns->acct.profile_count);
+	acct_rollup(ns, bytes, counted ? 1 : 0);
 }
 
 /**
@@ -479,7 +502,10 @@ void aa_ns_charge_profile(struct aa_profile *profile)
  */
 void aa_ns_charge_rawdata(struct aa_ns *ns, struct aa_loaddata *data)
 {
-	atomic_long_add(aa_loaddata_resident_size(data), &ns->acct.resident);
+	long bytes = aa_loaddata_resident_size(data);
+
+	atomic_long_add(bytes, &ns->acct.resident);
+	acct_rollup(ns, bytes, 0);
 }
 
 /**
@@ -491,7 +517,10 @@ void aa_ns_charge_rawdata(struct aa_ns *ns, struct aa_loaddata *data)
  */
 void aa_ns_uncharge_rawdata(struct aa_ns *ns, struct aa_loaddata *data)
 {
-	atomic_long_sub(aa_loaddata_resident_size(data), &ns->acct.resident);
+	long bytes = aa_loaddata_resident_size(data);
+
+	atomic_long_sub(bytes, &ns->acct.resident);
+	acct_rollup(ns, -bytes, 0);
 }
 
 /**
@@ -503,13 +532,16 @@ void aa_ns_uncharge_rawdata(struct aa_ns *ns, struct aa_loaddata *data)
 void aa_ns_uncharge_profile(struct aa_profile *profile)
 {
 	struct aa_ns *ns = profile->ns;
+	bool counted;
 
 	if (!ns || !profile->acct_resident)
 		return;
 
+	counted = !(profile->label.flags & FLAG_NULL);
 	atomic_long_sub(profile->acct_resident, &ns->acct.resident);
-	if (!(profile->label.flags & FLAG_NULL))
+	if (counted)
 		atomic_long_dec(&ns->acct.profile_count);
+	acct_rollup(ns, -profile->acct_resident, counted ? -1 : 0);
 	profile->acct_resident = 0;
 }
 

@@ -52,6 +52,8 @@ static inline void aa_ns_capset_init_unset(struct aa_ns_capset *caps)
  * @resident: current resident policy bytes charged to this ns (local scope)
  * @profile_count: current count of non-null profiles in this ns (local)
  * @ns_count: current number of direct child namespaces
+ * @subtree_resident: resident policy bytes of this ns plus all descendants
+ * @subtree_profile_count: non-null profiles of this ns plus all descendants
  * @ratelimit: bounds OP_NS_QUOTA audit emission
  */
 struct aa_ns_acct {
@@ -59,6 +61,8 @@ struct aa_ns_acct {
 	atomic_long_t resident;
 	atomic_long_t profile_count;
 	atomic_long_t ns_count;
+	atomic_long_t subtree_resident;
+	atomic_long_t subtree_profile_count;
 	struct ratelimit_state ratelimit;
 };
 

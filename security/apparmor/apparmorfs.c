@@ -1494,6 +1494,9 @@ SEQ_NS_FOPS(NAME)
 
 SEQ_NS_ACCT(acct_count, atomic_long_read(&ns->acct.profile_count));
 SEQ_NS_ACCT(acct_size, atomic_long_read(&ns->acct.resident));
+SEQ_NS_ACCT(acct_subtree_count,
+	    atomic_long_read(&ns->acct.subtree_profile_count));
+SEQ_NS_ACCT(acct_subtree_size, atomic_long_read(&ns->acct.subtree_resident));
 SEQ_NS_ACCT(acct_max_count, ns->acct.caps.limits.profiles);
 SEQ_NS_ACCT(acct_max_size, ns->acct.caps.limits.memory);
 SEQ_NS_ACCT(acct_max_profile, ns->acct.caps.limits.max_profile);
@@ -2262,6 +2265,10 @@ static const struct aa_ns_acct_file {
 	{ ".max_count",	  &seq_ns_acct_max_count_fops,	AAFS_NS_MAX_COUNT },
 	{ ".size",	  &seq_ns_acct_size_fops,	AAFS_NS_SIZE },
 	{ ".max_size",	  &seq_ns_acct_max_size_fops,	AAFS_NS_MAX_SIZE },
+	{ ".subtree_count", &seq_ns_acct_subtree_count_fops,
+						AAFS_NS_SUBTREE_COUNT },
+	{ ".subtree_size", &seq_ns_acct_subtree_size_fops,
+						AAFS_NS_SUBTREE_SIZE },
 	{ ".max_profile", &seq_ns_acct_max_profile_fops, AAFS_NS_MAX_PROFILE },
 	{ ".namespaces",  &seq_ns_acct_namespaces_fops,	AAFS_NS_NAMESPACES },
 	{ ".depth",	  &seq_ns_acct_depth_fops,	AAFS_NS_DEPTH },
