@@ -2158,12 +2158,14 @@ static int ns_rmdir_op(struct inode *dir, struct dentry *dentry)
 	struct aa_label *label;
 	int error;
 
+	/* held to the remove-verb check below, once the target ns is known */
 	label = begin_current_label_crit_section();
 	error = aa_may_manage_policy(current_cred(), label, NULL, NULL,
 				     AA_MAY_LOAD_POLICY);
-	end_current_label_crit_section(label);
-	if (error)
+	if (error) {
+		end_current_label_crit_section(label);
 		return error;
+	}
 
 	parent = get_ns_common_ref(dir->i_private);
 	/* rmdir calls the generic securityfs functions to remove files
@@ -2182,11 +2184,19 @@ static int ns_rmdir_op(struct inode *dir, struct dentry *dentry)
 	}
 	AA_BUG(ns_dir(ns) != dentry);
 
+	/* mediate the policyns remove verb on the target ns */
+	error = aa_policyns_perm(label, ns, AA_POLICYNS_REMOVE, OP_POLICYNS);
+	if (error) {
+		aa_put_ns(ns);
+		goto out;
+	}
+
 	__aa_remove_ns(ns);
 	aa_put_ns(ns);
 
 out:
 	mutex_unlock(&parent->lock);
+	end_current_label_crit_section(label);
 	inode_lock_nested(dir, I_MUTEX_PARENT);
 	inode_lock(dentry->d_inode);
 	aa_put_ns(parent);

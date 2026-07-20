@@ -1326,6 +1326,20 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 	} else
 		ns = aa_get_ns(policy_ns ? policy_ns : labels_ns(label));
 
+	/*
+	 * Mediate the policyns load/replace verb on the target ns. A create
+	 * that this load triggered was already mediated in __aa_create_ns.
+	 */
+	error = aa_policyns_perm(label, ns,
+				 (mask & AA_MAY_REPLACE_POLICY) ?
+					 AA_POLICYNS_REPLACE : AA_POLICYNS_LOAD,
+				 OP_POLICYNS);
+	if (error) {
+		info = "policyns permission denied";
+		ent = NULL;
+		goto fail;
+	}
+
 	mutex_lock_nested(&ns->lock, ns->level);
 	/* Tentative copies of the ns caps */
 	pend_limits = ns->acct.limits;
@@ -1627,6 +1641,14 @@ ssize_t aa_remove_profiles(struct aa_ns *policy_ns, struct aa_label *subj,
 	} else
 		/* released below */
 		ns = aa_get_ns(policy_ns ? policy_ns : labels_ns(subj));
+
+	/* mediate the policyns remove verb on the target ns */
+	error = aa_policyns_perm(subj, ns, AA_POLICYNS_REMOVE, OP_POLICYNS);
+	if (error) {
+		info = "policyns permission denied";
+		aa_put_ns(ns);
+		goto fail;
+	}
 
 	if (!name) {
 		/* remove namespace - can only happen if fqname[0] == ':' */
