@@ -2097,19 +2097,25 @@ static struct dentry *ns_mkdir_op(struct mnt_idmap *idmap, struct inode *dir,
 				  struct dentry *dentry, umode_t mode)
 {
 	struct aa_ns *ns, *parent;
-	/* TODO: improve permission check */
 	struct aa_label *label;
 	int error;
 
+	parent = get_ns_common_ref(dir->i_private);
+	AA_BUG(d_inode(ns_subns_dir(parent)) != dir);
+
+	/*
+	 * Held across the lock dance below and passed to
+	 * __aa_find_or_create_ns() so the policyns create permission is
+	 * mediated at the shared __aa_create_ns() chokepoint.
+	 */
 	label = begin_current_label_crit_section();
 	error = aa_may_manage_policy(current_cred(), label, NULL, NULL,
 				     AA_MAY_LOAD_POLICY);
-	end_current_label_crit_section(label);
-	if (error)
+	if (error) {
+		end_current_label_crit_section(label);
+		aa_put_ns(parent);
 		return ERR_PTR(error);
-
-	parent = get_ns_common_ref(dir->i_private);
-	AA_BUG(d_inode(ns_subns_dir(parent)) != dir);
+	}
 
 	/* we have to unlock and then relock to get locking order right
 	 * for pin_fs
@@ -2127,7 +2133,7 @@ static struct dentry *ns_mkdir_op(struct mnt_idmap *idmap, struct inode *dir,
 		goto out_pin;
 
 	ns = __aa_find_or_create_ns(parent, READ_ONCE(dentry->d_name.name),
-				    dentry);
+				    dentry, label);
 	if (IS_ERR(ns)) {
 		error = PTR_ERR(ns);
 		ns = NULL;
@@ -2139,6 +2145,7 @@ out_pin:
 		simple_release_fs(&aafs_mnt, &aafs_count);
 out:
 	mutex_unlock(&parent->lock);
+	end_current_label_crit_section(label);
 	aa_put_ns(parent);
 
 	return error ? ERR_PTR(error) : NULL;

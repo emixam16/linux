@@ -594,6 +594,209 @@ static void inherit_child_caps(struct aa_ns *child, struct aa_ns *parent)
 	cl->depth = cap_min(t->depth, cap_dec(pl->depth));
 }
 
+/*
+ * Mediation of the "policyns" permission rule (create/load/replace/remove).
+ * The class DFA encodes, after the AA_CLASS_POLICY_NS state reached by
+ * RULE_MEDIATES(): a \0 separator, a discriminator byte (target enum + 1)
+ * and, for the :NAME: target, the namespace name; the verb bits sit on the
+ * resulting state. This mirrors the parser's policyns_target_match().
+ */
+
+/* which target forms an operation can match, and the :NAME: name to match */
+struct policyns_match {
+	u16 forms;		/* bitmask of 1 << AA_POLICYNS_TGT_* */
+	const char *name;	/* view-relative target name for :NAME:, else NULL */
+};
+
+/* true if @ns is a proper descendant of @anc */
+static bool policyns_is_descendant(struct aa_ns *anc, struct aa_ns *ns)
+{
+	for (ns = ns->parent; ns; ns = ns->parent)
+		if (ns == anc)
+			return true;
+	return false;
+}
+
+static void policyns_perm_names(struct audit_buffer *ab, u32 mask)
+{
+	if (mask & AA_POLICYNS_CREATE)
+		audit_log_format(ab, "create ");
+	if (mask & AA_POLICYNS_LOAD)
+		audit_log_format(ab, "load ");
+	if (mask & AA_POLICYNS_REPLACE)
+		audit_log_format(ab, "replace ");
+	if (mask & AA_POLICYNS_REMOVE)
+		audit_log_format(ab, "remove ");
+}
+
+static void audit_policyns_cb(struct audit_buffer *ab, void *va)
+{
+	struct apparmor_audit_data *ad = aad_of_va(va);
+
+	if (ad->request & AA_VALID_POLICYNS_PERMS) {
+		audit_log_format(ab, " requested=\"");
+		policyns_perm_names(ab, ad->request);
+		audit_log_format(ab, "\"");
+	}
+	if (ad->denied & AA_VALID_POLICYNS_PERMS) {
+		audit_log_format(ab, " denied=\"");
+		policyns_perm_names(ab, ad->denied);
+		audit_log_format(ab, "\"");
+	}
+	if (ad->iface.ns) {
+		audit_log_format(ab, " target=");
+		audit_log_untrustedstring(ab, ad->iface.ns);
+	}
+}
+
+/* accumulate the perms the class DFA grants for one target form */
+static void policyns_accum(struct aa_policydb *policy, aa_state_t cstate,
+			   int target, const char *name, struct aa_perms *accum)
+{
+	aa_state_t state;
+
+	struct aa_perms *p;
+
+	state = aa_dfa_null_transition(policy->dfa, cstate);
+	if (state)
+		state = aa_dfa_next(policy->dfa, state, (char)(target + 1));
+	if (state && name)
+		state = aa_dfa_match(policy->dfa, state, name);
+	if (!state)
+		return;
+	/*
+	 * Union the grant across the applicable target forms - a verb is
+	 * allowed if any form allows it. The aa_perms_accum() helpers
+	 * intersect @allow (they expect @accum preloaded with allperms for
+	 * label-component matching), which is the wrong direction here.
+	 * aa_check_perms() still gives an explicit deny precedence.
+	 */
+	p = aa_lookup_perms(policy, state);
+	accum->allow |= p->allow;
+	accum->deny |= p->deny;
+	accum->audit |= p->audit;
+	accum->quiet |= p->quiet;
+	accum->prompt |= p->prompt;
+}
+
+static int policyns_profile_perm(struct aa_profile *profile,
+				 struct policyns_match *m,
+				 struct apparmor_audit_data *ad, u32 request)
+{
+	struct aa_ruleset *rules = profile->label.rules[0];
+	struct aa_perms perms = { };
+	aa_state_t cstate;
+	int i;
+
+	ad->subj_label = &profile->label;
+	ad->request = request;
+
+	/*
+	 * Gate on the class-mediates state, not profile_unconfined(): an
+	 * unconfined ns manager that carries a policyns rule still mediates.
+	 */
+	cstate = RULE_MEDIATES(rules, AA_CLASS_POLICY_NS);
+	if (!cstate)
+		return 0;
+
+	for (i = AA_POLICYNS_TGT_SELF; i <= AA_POLICYNS_TGT_NAME; i++) {
+		if (!(m->forms & (1 << i)))
+			continue;
+		policyns_accum(rules->policy, cstate, i,
+			       i == AA_POLICYNS_TGT_NAME ? m->name : NULL,
+			       &perms);
+	}
+	aa_apply_modes_to_perms(profile, &perms);
+	return aa_check_perms(profile, &perms, request, ad, audit_policyns_cb);
+}
+
+/**
+ * aa_policyns_perm - mediate a policyns operation on an existing @target ns
+ * @label: subject label performing the operation  (NOT NULL)
+ * @target: the namespace the operation acts on  (NOT NULL)
+ * @request: the verb bit (AA_POLICYNS_LOAD/REPLACE/REMOVE)
+ * @op: audit operation string
+ *
+ * Returns: 0 if allowed, else a negative errno.
+ */
+int aa_policyns_perm(struct aa_label *label, struct aa_ns *target,
+		     u32 request, const char *op)
+{
+	DEFINE_AUDIT_DATA(ad, LSM_AUDIT_DATA_NONE, AA_CLASS_POLICY_NS, op);
+	struct aa_ns *subj = labels_ns(label);
+	struct policyns_match m = { };
+	struct aa_profile *profile;
+
+	if (target == subj)
+		m.forms |= 1 << AA_POLICYNS_TGT_SELF;
+	if (target == root_ns)
+		m.forms |= 1 << AA_POLICYNS_TGT_ROOT;
+	if (target->parent == subj)
+		m.forms |= 1 << AA_POLICYNS_TGT_CHILDREN;
+	if (policyns_is_descendant(subj, target))
+		m.forms |= 1 << AA_POLICYNS_TGT_DESCENDANTS;
+	/* :NAME: matches the target's name as seen from the subject ns */
+	if (target != subj && aa_ns_visible(subj, target, true)) {
+		m.name = aa_ns_name(subj, target, true);
+		m.forms |= 1 << AA_POLICYNS_TGT_NAME;
+	}
+	ad.iface.ns = target->base.hname;
+
+	return fn_for_each(label, profile,
+			   policyns_profile_perm(profile, &m, &ad, request));
+}
+
+/**
+ * aa_policyns_create_perm - mediate creating a new ns @name under @parent
+ * @label: subject label performing the creation  (NOT NULL)
+ * @parent: the namespace the new child is created under  (NOT NULL)
+ * @name: the new child's name  (NOT NULL)
+ *
+ * The parser forbids create against self/root, so only the children,
+ * descendants and :NAME: forms can grant it.
+ *
+ * Returns: 0 if allowed, else a negative errno.
+ */
+int aa_policyns_create_perm(struct aa_label *label, struct aa_ns *parent,
+			    const char *name)
+{
+	DEFINE_AUDIT_DATA(ad, LSM_AUDIT_DATA_NONE, AA_CLASS_POLICY_NS,
+			  OP_POLICYNS);
+	struct aa_ns *subj = labels_ns(label);
+	struct policyns_match m = { };
+	struct aa_profile *profile;
+	char namebuf[256];
+
+	/* the new ns is a direct child of @parent */
+	if (parent == subj)
+		m.forms |= 1 << AA_POLICYNS_TGT_CHILDREN;
+	if (parent == subj || policyns_is_descendant(subj, parent))
+		m.forms |= 1 << AA_POLICYNS_TGT_DESCENDANTS;
+	/* build the new ns name as seen from the subject ns for :NAME: */
+	if (parent == subj) {
+		m.name = name;
+		m.forms |= 1 << AA_POLICYNS_TGT_NAME;
+	} else if (aa_ns_visible(subj, parent, true)) {
+		int len = snprintf(namebuf, sizeof(namebuf), "%s//%s",
+				   aa_ns_name(subj, parent, true), name);
+
+		/*
+		 * If the view-relative name does not fit, reject the create:
+		 * dropping the :NAME: form while children/descendants still
+		 * applied would let a name-targeted deny slip through.
+		 */
+		if (len < 0 || len >= (int)sizeof(namebuf))
+			return -ENAMETOOLONG;
+		m.name = namebuf;
+		m.forms |= 1 << AA_POLICYNS_TGT_NAME;
+	}
+	ad.iface.ns = name;
+
+	return fn_for_each(label, profile,
+			   policyns_profile_perm(profile, &m,
+						 &ad, AA_POLICYNS_CREATE));
+}
+
 /**
  * __aa_lookupn_ns - lookup the namespace matching @hname
  * @view: namespace to search in  (NOT NULL)
@@ -649,7 +852,7 @@ struct aa_ns *aa_lookupn_ns(struct aa_ns *view, const char *name, size_t n)
 }
 
 static struct aa_ns *__aa_create_ns(struct aa_ns *parent, const char *name,
-				    struct dentry *dir)
+				    struct dentry *dir, struct aa_label *label)
 {
 	struct aa_ns *ns;
 	int error;
@@ -660,6 +863,14 @@ static struct aa_ns *__aa_create_ns(struct aa_ns *parent, const char *name,
 
 	if (parent->level > MAX_NS_DEPTH)
 		return ERR_PTR(-ENOSPC);
+	/*
+	 * Mediate the policyns create permission at this shared chokepoint,
+	 * so mkdir, name-routed loads and every nested level are all gated;
+	 * the permission check runs before the quota admission below.
+	 */
+	error = aa_policyns_create_perm(label, parent, name);
+	if (error)
+		return ERR_PTR(error);
 	/* per-ns structural caps: breadth and depth */
 	error = aa_ns_admit_create(parent);
 	if (error)
@@ -698,7 +909,7 @@ static struct aa_ns *__aa_create_ns(struct aa_ns *parent, const char *name,
  * Returns: the a refcounted ns that has been add or an ERR_PTR
  */
 struct aa_ns *__aa_find_or_create_ns(struct aa_ns *parent, const char *name,
-				     struct dentry *dir)
+				     struct dentry *dir, struct aa_label *label)
 {
 	struct aa_ns *ns;
 
@@ -708,7 +919,7 @@ struct aa_ns *__aa_find_or_create_ns(struct aa_ns *parent, const char *name,
 	/* released by caller */
 	ns = aa_get_ns(__aa_find_ns(&parent->sub_ns, name));
 	if (!ns)
-		ns = __aa_create_ns(parent, name, dir);
+		ns = __aa_create_ns(parent, name, dir, label);
 	else
 		ns = ERR_PTR(-EEXIST);
 
@@ -723,7 +934,8 @@ struct aa_ns *__aa_find_or_create_ns(struct aa_ns *parent, const char *name,
  *
  * Returns: refcounted namespace or PTR_ERR if failed to create one
  */
-struct aa_ns *aa_prepare_ns(struct aa_ns *parent, const char *name)
+struct aa_ns *aa_prepare_ns(struct aa_ns *parent, const char *name,
+			    struct aa_label *label)
 {
 	struct aa_ns *ns;
 
@@ -732,7 +944,7 @@ struct aa_ns *aa_prepare_ns(struct aa_ns *parent, const char *name)
 	/* released by caller */
 	ns = aa_get_ns(__aa_find_ns(&parent->sub_ns, name));
 	if (!ns)
-		ns = __aa_create_ns(parent, name, NULL);
+		ns = __aa_create_ns(parent, name, NULL, label);
 	mutex_unlock(&parent->lock);
 
 	/* return ref */

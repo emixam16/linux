@@ -1314,7 +1314,7 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 	}
 	if (ns_name) {
 		ns = aa_prepare_ns(policy_ns ? policy_ns : labels_ns(label),
-				   ns_name);
+				   ns_name, label);
 		if (IS_ERR(ns)) {
 			op = OP_PROF_LOAD;
 			info = "failed to prepare namespace";

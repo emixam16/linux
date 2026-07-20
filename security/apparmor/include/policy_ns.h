@@ -103,8 +103,9 @@ void aa_free_root_ns(void);
 struct aa_ns *__aa_lookupn_ns(struct aa_ns *view, const char *hname, size_t n);
 struct aa_ns *aa_lookupn_ns(struct aa_ns *view, const char *name, size_t n);
 struct aa_ns *__aa_find_or_create_ns(struct aa_ns *parent, const char *name,
-				     struct dentry *dir);
-struct aa_ns *aa_prepare_ns(struct aa_ns *root, const char *name);
+				     struct dentry *dir, struct aa_label *label);
+struct aa_ns *aa_prepare_ns(struct aa_ns *root, const char *name,
+			    struct aa_label *label);
 void __aa_remove_ns(struct aa_ns *ns);
 
 /* policy-namespace resource accounting (see policy-ns quota feature) */
@@ -134,6 +135,11 @@ int aa_ns_admit_load_set(struct aa_ns *ns, struct list_head *lh,
  */
 int aa_ns_apply_budget(struct aa_ns_caps *limits, struct aa_ns_caps *child,
 		       struct aa_ns_budget *budget);
+/* mediate the policyns permission rule (create/load/replace/remove) */
+int aa_policyns_perm(struct aa_label *label, struct aa_ns *target,
+		     u32 request, const char *op);
+int aa_policyns_create_perm(struct aa_label *label, struct aa_ns *parent,
+			    const char *name);
 
 static inline struct aa_profile *aa_deref_parent(struct aa_profile *p)
 {
