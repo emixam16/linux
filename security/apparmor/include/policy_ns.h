@@ -28,17 +28,34 @@ struct apparmor_audit_data;
 #define AA_NS_QUOTA_RATELIMIT_INTERVAL	(5 * HZ)
 #define AA_NS_QUOTA_RATELIMIT_BURST	10
 
-/* struct aa_ns_acct - per-namespace resource accounting and caps
+/* struct aa_ns_capset - the standing caps a namespace enforces and stamps
  * @limits: caps enforced against this namespace (self)
  * @child: template caps stamped onto namespaces this namespace creates (children)
+ * @child_percent: keys in @child holding a raw percentage (0-100) of the
+ *		   parent's corresponding cap, resolved per child at creation
+ */
+struct aa_ns_capset {
+	struct aa_ns_caps limits;
+	struct aa_ns_caps child;
+	u32 child_percent;
+};
+
+static inline void aa_ns_capset_init_unset(struct aa_ns_capset *caps)
+{
+	aa_ns_caps_init_unset(&caps->limits);
+	aa_ns_caps_init_unset(&caps->child);
+	caps->child_percent = 0;
+}
+
+/* struct aa_ns_acct - per-namespace resource accounting and caps
+ * @caps: the caps enforced against and stamped by this namespace
  * @resident: current resident policy bytes charged to this ns (local scope)
  * @profile_count: current count of non-null profiles in this ns (local)
  * @ns_count: current number of direct child namespaces
  * @ratelimit: bounds OP_NS_QUOTA audit emission
  */
 struct aa_ns_acct {
-	struct aa_ns_caps limits;
-	struct aa_ns_caps child;
+	struct aa_ns_capset caps;
 	atomic_long_t resident;
 	atomic_long_t profile_count;
 	atomic_long_t ns_count;
@@ -130,11 +147,10 @@ struct aa_load_ent;
 int aa_ns_admit_load_set(struct aa_ns *ns, struct list_head *lh,
 			 struct aa_ns_caps *limits, struct aa_loaddata *udata,
 			 struct aa_load_ent **fail_ent, const char **info);
-/* apply one parsed "policyns limits" block to a (tentative) caps pair;
+/* apply one parsed "policyns limits" block to a (tentative) capset;
  * returns -EOPNOTSUPP for a construct this kernel does not yet enforce
  */
-int aa_ns_apply_budget(struct aa_ns_caps *limits, struct aa_ns_caps *child,
-		       struct aa_ns_budget *budget);
+int aa_ns_apply_budget(struct aa_ns_capset *caps, struct aa_ns_budget *budget);
 /* mediate the policyns permission rule (create/load/replace/remove) */
 int aa_policyns_perm(struct aa_label *label, struct aa_ns *target,
 		     u32 request, const char *op);

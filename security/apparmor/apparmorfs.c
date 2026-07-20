@@ -1494,12 +1494,12 @@ SEQ_NS_FOPS(NAME)
 
 SEQ_NS_ACCT(acct_count, atomic_long_read(&ns->acct.profile_count));
 SEQ_NS_ACCT(acct_size, atomic_long_read(&ns->acct.resident));
-SEQ_NS_ACCT(acct_max_count, ns->acct.limits.profiles);
-SEQ_NS_ACCT(acct_max_size, ns->acct.limits.memory);
-SEQ_NS_ACCT(acct_max_profile, ns->acct.limits.max_profile);
-SEQ_NS_ACCT(acct_namespaces, ns->acct.limits.namespaces);
-SEQ_NS_ACCT(acct_depth, ns->acct.limits.depth);
-SEQ_NS_ACCT(acct_criu, ns->acct.limits.criu);
+SEQ_NS_ACCT(acct_max_count, ns->acct.caps.limits.profiles);
+SEQ_NS_ACCT(acct_max_size, ns->acct.caps.limits.memory);
+SEQ_NS_ACCT(acct_max_profile, ns->acct.caps.limits.max_profile);
+SEQ_NS_ACCT(acct_namespaces, ns->acct.caps.limits.namespaces);
+SEQ_NS_ACCT(acct_depth, ns->acct.caps.limits.depth);
+SEQ_NS_ACCT(acct_criu, ns->acct.caps.limits.criu);
 
 
 /* policy/raw_data/ * file ops */

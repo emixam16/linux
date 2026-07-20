@@ -1275,7 +1275,7 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 	struct aa_ns *ns = NULL;
 	struct aa_load_ent *ent, *tmp;
 	struct aa_loaddata *rawdata_ent;
-	struct aa_ns_caps pend_limits, pend_child;
+	struct aa_ns_capset pend_caps;
 	const char *op;
 	ssize_t count, error;
 	LIST_HEAD(lh);
@@ -1341,9 +1341,8 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 	}
 
 	mutex_lock_nested(&ns->lock, ns->level);
-	/* Tentative copies of the ns caps */
-	pend_limits = ns->acct.limits;
-	pend_child = ns->acct.child;
+	/* Tentative copy of the ns caps */
+	pend_caps = ns->acct.caps;
 	/* check for duplicate rawdata blobs: space and file dedup */
 	if (!list_empty(&ns->rawdata_list)) {
 		list_for_each_entry(rawdata_ent, &ns->rawdata_list, list) {
@@ -1435,8 +1434,7 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 			int b;
 
 			for (b = 0; b < ent->new->n_budgets; b++) {
-				error = aa_ns_apply_budget(&pend_limits,
-							   &pend_child,
+				error = aa_ns_apply_budget(&pend_caps,
 							   &ent->new->budgets[b]);
 				if (error) {
 					info = "policyns limits: unsupported construct";
@@ -1460,7 +1458,8 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 	 * Admission: check the whole load set against the tentative caps
 	 * before installing anything, so a breach rejects the whole set.
 	 */
-	error = aa_ns_admit_load_set(ns, &lh, &pend_limits, udata, &ent, &info);
+	error = aa_ns_admit_load_set(ns, &lh, &pend_caps.limits, udata, &ent,
+				     &info);
 	if (error)
 		goto fail_lock;
 
@@ -1493,8 +1492,7 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 
 	/* Done with checks that may fail - do actual replacement */
 	/* commit the caps the load was admitted against */
-	ns->acct.limits = pend_limits;
-	ns->acct.child = pend_child;
+	ns->acct.caps = pend_caps;
 	__aa_bump_ns_revision(ns);
 	if (aa_g_export_binary)
 		__aa_loaddata_update(udata, ns->revision);

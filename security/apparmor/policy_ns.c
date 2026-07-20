@@ -206,8 +206,7 @@ void aa_ns_acct_init(struct aa_ns *ns)
 {
 	struct aa_ns_acct *acct = &ns->acct;
 
-	aa_ns_caps_init_unset(&acct->limits);
-	aa_ns_caps_init_unset(&acct->child);
+	aa_ns_capset_init_unset(&acct->caps);
 	atomic_long_set(&acct->resident, 0);
 	atomic_long_set(&acct->profile_count, 0);
 	atomic_long_set(&acct->ns_count, 0);
@@ -298,7 +297,7 @@ static int cap_admit_delta(struct aa_ns *ns, enum aa_policyns_key key,
  */
 int aa_ns_admit_create(struct aa_ns *parent)
 {
-	struct aa_ns_caps *pl = &parent->acct.limits;
+	struct aa_ns_caps *pl = &parent->acct.caps.limits;
 	int error;
 
 	if (!aa_g_policy_ns_quota)
@@ -519,9 +518,12 @@ void aa_ns_uncharge_profile(struct aa_profile *profile)
  * @dst: destination caps, treated as a long array in wire-key order
  * @b: parsed budget block
  * @tighten: cap_min() against the existing value (self) vs overwrite (children)
+ *
+ * Percentage values are stored raw; they are resolved against the parent's
+ * cap when a child is created, so the ratio has no load-order dependence.
  */
 static void apply_budget_keys(struct aa_ns_caps *dst, struct aa_ns_budget *b,
-			      bool tighten, const struct aa_ns_caps *pct_base)
+			      bool tighten)
 {
 	long *cap = (long *)dst;
 	int k;
@@ -531,23 +533,17 @@ static void apply_budget_keys(struct aa_ns_caps *dst, struct aa_ns_budget *b,
 
 		if (!(b->specified & (1u << k)))
 			continue;
-		if (b->percent & (1u << k))
-			/* N% of the parent's own cap for key @k */
-			v = cap_percent(((const long *)pct_base)[k], b->values[k]);
-		else
-			v = b->values[k];
+		v = b->values[k];
 		cap[k] = tighten ? cap_min(cap[k], v) : v;
 	}
 }
 
 /**
- * aa_ns_apply_budget - apply one parsed "policyns limits" block to a caps pair
- * @limits: the (tentative) self caps of the namespace the load targets
- * @child: the (tentative) children template of that namespace
+ * aa_ns_apply_budget - apply one parsed "policyns limits" block to a capset
+ * @caps: the (tentative) capset of the namespace the load targets
  * @b: one parsed budget block
  */
-int aa_ns_apply_budget(struct aa_ns_caps *limits, struct aa_ns_caps *child,
-		       struct aa_ns_budget *b)
+int aa_ns_apply_budget(struct aa_ns_capset *caps, struct aa_ns_budget *b)
 {
 	/* Some features remains to be implemented and are rejected with -EOPNOTSUPP. */
 	if (b->scope == AA_POLICYNS_SCOPE_SUBTREE)
@@ -560,38 +556,60 @@ int aa_ns_apply_budget(struct aa_ns_caps *limits, struct aa_ns_caps *child,
 	case AA_POLICYNS_TGT_SELF:
 		if (b->percent)		/* % is a per-child ratio only */
 			return -EOPNOTSUPP;
-		apply_budget_keys(limits, b, true, NULL);
+		apply_budget_keys(&caps->limits, b, true);
 		return 0;
 	case AA_POLICYNS_TGT_CHILDREN:
-		aa_ns_caps_init_unset(child);
-		apply_budget_keys(child, b, false, limits);
+		/* the block is the template: last children block wins */
+		aa_ns_caps_init_unset(&caps->child);
+		apply_budget_keys(&caps->child, b, false);
+		caps->child_percent = b->percent;
 		return 0;
 	default:	/* descendants/root/:NAME: not yet enforced */
 		return -EOPNOTSUPP;
 	}
 }
 
+/* resolve_percent_caps - resolve raw percentage keys against @base's caps */
+static void resolve_percent_caps(struct aa_ns_caps *caps, u32 percent,
+				 const struct aa_ns_caps *base)
+{
+	long *cap = (long *)caps;
+	const long *b = (const long *)base;
+	int k;
+
+	for (k = 0; k < AA_POLICYNS_KEY_MAX; k++)
+		if (percent & (1u << k))
+			cap[k] = cap_percent(b[k], cap[k]);
+}
+
 /* inherit_child_caps - compute a new child's caps from @parent's template */
 static void inherit_child_caps(struct aa_ns *child, struct aa_ns *parent)
 {
-	struct aa_ns_caps *t = &parent->acct.child;
-	struct aa_ns_caps *pl = &parent->acct.limits;
-	struct aa_ns_caps *cl = &child->acct.limits;
+	struct aa_ns_caps *pl = &parent->acct.caps.limits;
+	struct aa_ns_caps *cl = &child->acct.caps.limits;
 	struct aa_ns_acct *pa = &parent->acct;
+	struct aa_ns_caps t = parent->acct.caps.child;
 
-	cl->memory = cap_min(t->memory,
+	/*
+	 * Resolve percentage keys against the parent's cap in a local copy of
+	 * the template - never in place - so every child gets the ratio of
+	 * the parent's caps as they stand at its creation.
+	 */
+	resolve_percent_caps(&t, parent->acct.caps.child_percent, pl);
+
+	cl->memory = cap_min(t.memory,
 			     cap_remaining(pl->memory,
 					   atomic_long_read(&pa->resident)));
-	cl->profiles = cap_min(t->profiles,
+	cl->profiles = cap_min(t.profiles,
 			       cap_remaining(pl->profiles,
 					     atomic_long_read(&pa->profile_count)));
-	cl->namespaces = cap_min(t->namespaces,
+	cl->namespaces = cap_min(t.namespaces,
 				 cap_remaining(pl->namespaces,
 					       atomic_long_read(&pa->ns_count)));
-	cl->max_profile = cap_min(t->max_profile, pl->max_profile);
-	cl->criu = cap_min(t->criu, pl->criu);
-	cl->load_rate = cap_min(t->load_rate, pl->load_rate);
-	cl->depth = cap_min(t->depth, cap_dec(pl->depth));
+	cl->max_profile = cap_min(t.max_profile, pl->max_profile);
+	cl->criu = cap_min(t.criu, pl->criu);
+	cl->load_rate = cap_min(t.load_rate, pl->load_rate);
+	cl->depth = cap_min(t.depth, cap_dec(pl->depth));
 }
 
 /*
