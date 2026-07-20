@@ -1503,6 +1503,7 @@ SEQ_NS_ACCT(acct_max_profile, ns->acct.caps.limits.max_profile);
 SEQ_NS_ACCT(acct_namespaces, ns->acct.caps.limits.namespaces);
 SEQ_NS_ACCT(acct_depth, ns->acct.caps.limits.depth);
 SEQ_NS_ACCT(acct_criu, ns->acct.caps.limits.criu);
+SEQ_NS_ACCT(acct_criu_size, atomic_long_read(&ns->acct.criu_resident));
 
 
 /* policy/raw_data/ * file ops */
@@ -2273,6 +2274,7 @@ static const struct aa_ns_acct_file {
 	{ ".namespaces",  &seq_ns_acct_namespaces_fops,	AAFS_NS_NAMESPACES },
 	{ ".depth",	  &seq_ns_acct_depth_fops,	AAFS_NS_DEPTH },
 	{ ".criu",	  &seq_ns_acct_criu_fops,	AAFS_NS_CRIU },
+	{ ".criu_size",	  &seq_ns_acct_criu_size_fops,	AAFS_NS_CRIU_SIZE },
 };
 
 static int __aafs_ns_mkdir_entries(struct aa_ns *ns, struct dentry *dir)
@@ -2697,7 +2699,7 @@ static struct aa_sfs_entry aa_sfs_entry_ns_quota[] = {
 	 * (subtree, criu, load_rate, descendants, root, name, mediation).
 	 */
 	AA_SFS_FILE_STRING("mask",
-			   "self children percent local subtree mediation"),
+			   "self children percent local subtree criu mediation"),
 	{ }
 };
 

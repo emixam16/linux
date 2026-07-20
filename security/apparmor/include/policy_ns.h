@@ -63,6 +63,8 @@ static inline void aa_ns_capset_init_unset(struct aa_ns_capset *caps)
  * @ns_count: current number of direct child namespaces
  * @subtree_resident: resident policy bytes of this ns plus all descendants
  * @subtree_profile_count: non-null profiles of this ns plus all descendants
+ * @criu_resident: retained raw policy bytes charged to this ns (local)
+ * @subtree_criu: retained raw policy bytes of this ns plus all descendants
  * @ratelimit: bounds OP_NS_QUOTA audit emission
  */
 struct aa_ns_acct {
@@ -72,6 +74,8 @@ struct aa_ns_acct {
 	atomic_long_t ns_count;
 	atomic_long_t subtree_resident;
 	atomic_long_t subtree_profile_count;
+	atomic_long_t criu_resident;
+	atomic_long_t subtree_criu;
 	struct ratelimit_state ratelimit;
 };
 

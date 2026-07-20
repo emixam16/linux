@@ -221,6 +221,8 @@ void aa_ns_acct_init(struct aa_ns *ns)
 	atomic_long_set(&acct->ns_count, 0);
 	atomic_long_set(&acct->subtree_resident, 0);
 	atomic_long_set(&acct->subtree_profile_count, 0);
+	atomic_long_set(&acct->criu_resident, 0);
+	atomic_long_set(&acct->subtree_criu, 0);
 	ratelimit_state_init(&acct->ratelimit,
 			     AA_NS_QUOTA_RATELIMIT_INTERVAL,
 			     AA_NS_QUOTA_RATELIMIT_BURST);
@@ -412,7 +414,7 @@ static long effective_max_profile(struct aa_ns *ns, struct aa_ns_capset *pend,
  * of these caps is set.
  */
 static int admit_subtree_agg(struct aa_ns *ns, struct aa_ns_capset *pend,
-			     long bytes, long profiles)
+			     long bytes, long profiles, long criu)
 {
 	struct aa_ns *a;
 	int error;
@@ -430,6 +432,10 @@ static int admit_subtree_agg(struct aa_ns *ns, struct aa_ns_capset *pend,
 					sc->profiles,
 					&a->acct.subtree_profile_count,
 					profiles, -EDQUOT);
+		if (error)
+			return error;
+		error = cap_admit_delta(a, AA_POLICYNS_KEY_CRIU, sc->criu,
+					&a->acct.subtree_criu, criu, -ENOSPC);
 		if (error)
 			return error;
 	}
@@ -495,6 +501,7 @@ int aa_ns_admit_load_set(struct aa_ns *ns, struct list_head *lh,
 {
 	long new_bytes = 0, old_bytes = 0;
 	long new_count = 0, old_count = 0;
+	long raw_bytes = 0;
 	struct aa_load_ent *ent;
 	struct aa_ns *mp_owner;
 	long mp_limit;
@@ -533,10 +540,13 @@ int aa_ns_admit_load_set(struct aa_ns *ns, struct list_head *lh,
 		}
 	}
 	/* a newly retained rawdata blob is charged too (same condition as
-	 * the __aa_fs_create_rawdata call in aa_replace_profiles)
+	 * the __aa_fs_create_rawdata call in aa_replace_profiles); it is
+	 * also what the criu reserve caps
 	 */
-	if (!udata->dents[AAFS_LOADDATA_DIR] && aa_g_export_binary)
-		new_bytes += aa_loaddata_resident_size(udata);
+	if (!udata->dents[AAFS_LOADDATA_DIR] && aa_g_export_binary) {
+		raw_bytes = aa_loaddata_resident_size(udata);
+		new_bytes += raw_bytes;
+	}
 
 	error = aa_ns_admit_resident(ns, &pend->limits, new_bytes - old_bytes);
 	if (error) {
@@ -550,8 +560,15 @@ int aa_ns_admit_load_set(struct aa_ns *ns, struct list_head *lh,
 		*info = "namespace profile cap exceeded";
 		return error;
 	}
+	error = cap_admit_delta(ns, AA_POLICYNS_KEY_CRIU, pend->limits.criu,
+				&ns->acct.criu_resident, raw_bytes, -ENOSPC);
+	if (error) {
+		*fail_ent = NULL;
+		*info = "namespace criu reserve exceeded";
+		return error;
+	}
 	error = admit_subtree_agg(ns, pend, new_bytes - old_bytes,
-				  new_count - old_count);
+				  new_count - old_count, raw_bytes);
 	if (error) {
 		*fail_ent = NULL;
 		*info = "subtree cap exceeded";
@@ -565,16 +582,18 @@ int aa_ns_admit_load_set(struct aa_ns *ns, struct list_head *lh,
  * @ns: the namespace the delta was charged to  (NOT NULL)
  * @bytes: resident byte delta (may be negative)
  * @profiles: non-null profile count delta (may be negative)
+ * @criu: retained raw policy byte delta (may be negative)
  *
  * The parent chain is stable for the life of @ns (each ns holds a ref on its
  * parent and is never reparented), so the lockless atomic walk is safe from
  * any charge/uncharge context.
  */
-static void acct_rollup(struct aa_ns *ns, long bytes, long profiles)
+static void acct_rollup(struct aa_ns *ns, long bytes, long profiles, long criu)
 {
 	for (; ns; ns = ns->parent) {
 		atomic_long_add(bytes, &ns->acct.subtree_resident);
 		atomic_long_add(profiles, &ns->acct.subtree_profile_count);
+		atomic_long_add(criu, &ns->acct.subtree_criu);
 	}
 }
 
@@ -599,7 +618,7 @@ void aa_ns_charge_profile(struct aa_profile *profile)
 	atomic_long_add(bytes, &ns->acct.resident);
 	if (counted)
 		atomic_long_inc(&ns->acct.profile_count);
-	acct_rollup(ns, bytes, counted ? 1 : 0);
+	acct_rollup(ns, bytes, counted ? 1 : 0, 0);
 }
 
 /**
@@ -614,7 +633,8 @@ void aa_ns_charge_rawdata(struct aa_ns *ns, struct aa_loaddata *data)
 	long bytes = aa_loaddata_resident_size(data);
 
 	atomic_long_add(bytes, &ns->acct.resident);
-	acct_rollup(ns, bytes, 0);
+	atomic_long_add(bytes, &ns->acct.criu_resident);
+	acct_rollup(ns, bytes, 0, bytes);
 }
 
 /**
@@ -629,7 +649,8 @@ void aa_ns_uncharge_rawdata(struct aa_ns *ns, struct aa_loaddata *data)
 	long bytes = aa_loaddata_resident_size(data);
 
 	atomic_long_sub(bytes, &ns->acct.resident);
-	acct_rollup(ns, -bytes, 0);
+	atomic_long_sub(bytes, &ns->acct.criu_resident);
+	acct_rollup(ns, -bytes, 0, -bytes);
 }
 
 /**
@@ -650,7 +671,7 @@ void aa_ns_uncharge_profile(struct aa_profile *profile)
 	atomic_long_sub(profile->acct_resident, &ns->acct.resident);
 	if (counted)
 		atomic_long_dec(&ns->acct.profile_count);
-	acct_rollup(ns, -profile->acct_resident, counted ? -1 : 0);
+	acct_rollup(ns, -profile->acct_resident, counted ? -1 : 0, 0);
 	profile->acct_resident = 0;
 }
 
@@ -689,8 +710,7 @@ int aa_ns_apply_budget(struct aa_ns_capset *caps, struct aa_ns_budget *b)
 	bool subtree = b->scope == AA_POLICYNS_SCOPE_SUBTREE;
 
 	/* Some features remains to be implemented and are rejected with -EOPNOTSUPP. */
-	if (b->specified & ((1u << AA_POLICYNS_KEY_CRIU) |
-			    (1u << AA_POLICYNS_KEY_LOAD_RATE)))
+	if (b->specified & (1u << AA_POLICYNS_KEY_LOAD_RATE))
 		return -EOPNOTSUPP;
 	/* the parser rejects subtree scope on the other keys at parse time */
 	if (subtree && (b->specified & ~AA_POLICYNS_SUBTREE_KEYS))
