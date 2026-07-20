@@ -666,6 +666,9 @@ VISIBLE_IF_KUNIT int unpack_policyns_block(struct aa_ext *e,
 			goto fail;
 		if (v > INT_MAX)	/* parser bounds caps at INT_MAX */
 			goto fail;	/* out of range */
+		/* a percentage is a ratio (bounded at 100) */
+		if ((b->percent & (1u << k)) && v > 100)
+			goto fail;
 		b->values[k] = (long)v;
 	}
 	if (!aa_unpack_nameX(e, AA_ARRAYEND, NULL))
@@ -683,6 +686,9 @@ VISIBLE_IF_KUNIT int unpack_policyns_block(struct aa_ext *e,
 
 	/* reject specified/percent bits outside the known key range */
 	if ((b->specified | b->percent) & ~((1u << AA_POLICYNS_KEY_MAX) - 1))
+		goto fail;
+	/* a percentage bit is only coherent on a key the block specifies */
+	if (b->percent & ~b->specified)
 		goto fail;
 
 	return 1;

@@ -7,6 +7,7 @@
 #include <kunit/visibility.h>
 
 #include "include/policy.h"
+#include "include/policy_ns.h"
 #include "include/policy_unpack.h"
 
 #include <linux/limits.h>
@@ -982,6 +983,170 @@ static void policy_unpack_test_policyns_sequential_blocks(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.end);
 }
 
+static void policy_unpack_test_policyns_percent_over_100(struct kunit *test)
+{
+	struct pn_block_shape s = PN_WELLFORMED_SHAPE;
+	struct pn_blob *b = pn_blob_alloc(test);
+	struct aa_ns_budget budget = {};
+
+	s.percent = BIT(AA_POLICYNS_KEY_MEMORY);
+	s.value0 = 101;
+	pn_put_block(test, b, &s);
+	pn_blob_seal(b);
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), -EPROTO);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.start);
+
+	b = pn_blob_alloc(test);
+	s.value0 = 100;
+	pn_put_block(test, b, &s);
+	pn_blob_seal(b);
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), 1);
+	KUNIT_EXPECT_EQ(test, budget.values[AA_POLICYNS_KEY_MEMORY], 100L);
+}
+
+static void policy_unpack_test_policyns_percent_not_specified(struct kunit *test)
+{
+	struct pn_block_shape s = PN_WELLFORMED_SHAPE;
+	struct pn_blob *b = pn_blob_alloc(test);
+	struct aa_ns_budget budget = {};
+
+	/* a percentage bit on a key the block does not specify is incoherent */
+	s.percent = BIT(AA_POLICYNS_KEY_PROFILES);
+	pn_put_block(test, b, &s);
+	pn_blob_seal(b);
+	KUNIT_EXPECT_EQ(test, unpack_policyns_block(&b->e, &budget), -EPROTO);
+	KUNIT_EXPECT_PTR_EQ(test, b->e.pos, b->e.start);
+}
+
+/*
+ * aa_ns_apply_budget() semantic tests, on a synthetic capset. The budget
+ * struct is the post-unpack form, so blocks are built directly.
+ */
+
+static void policy_unpack_test_policyns_apply_scopes(struct kunit *test)
+{
+	struct aa_ns_budget b = {};
+	struct aa_ns_capset caps;
+
+	aa_ns_capset_init_unset(&caps);
+
+	/* self + local tightens the local caps and leaves subtree alone */
+	b.target = AA_POLICYNS_TGT_SELF;
+	b.scope = AA_POLICYNS_SCOPE_LOCAL;
+	b.specified = BIT(AA_POLICYNS_KEY_MEMORY);
+	b.values[AA_POLICYNS_KEY_MEMORY] = SZ_1M;
+	KUNIT_EXPECT_EQ(test, aa_ns_apply_budget(&caps, &b), 0);
+	KUNIT_EXPECT_EQ(test, caps.limits.memory, (long)SZ_1M);
+	KUNIT_EXPECT_EQ(test, caps.subtree.memory, AA_NS_NOLIMIT);
+
+	/* self + subtree stamps the subtree caps, not the local ones */
+	b.scope = AA_POLICYNS_SCOPE_SUBTREE;
+	b.values[AA_POLICYNS_KEY_MEMORY] = SZ_2M;
+	KUNIT_EXPECT_EQ(test, aa_ns_apply_budget(&caps, &b), 0);
+	KUNIT_EXPECT_EQ(test, caps.subtree.memory, (long)SZ_2M);
+	KUNIT_EXPECT_EQ(test, caps.limits.memory, (long)SZ_1M);
+
+	/* self is tighten-only: a looser value cannot raise the cap */
+	b.scope = AA_POLICYNS_SCOPE_LOCAL;
+	b.values[AA_POLICYNS_KEY_MEMORY] = SZ_8M;
+	KUNIT_EXPECT_EQ(test, aa_ns_apply_budget(&caps, &b), 0);
+	KUNIT_EXPECT_EQ(test, caps.limits.memory, (long)SZ_1M);
+
+	/* criu and load_rate are enforced keys now, applied like the rest */
+	b.specified = BIT(AA_POLICYNS_KEY_CRIU) |
+		      BIT(AA_POLICYNS_KEY_LOAD_RATE);
+	b.values[AA_POLICYNS_KEY_CRIU] = SZ_4M;
+	b.values[AA_POLICYNS_KEY_LOAD_RATE] = 20;
+	KUNIT_EXPECT_EQ(test, aa_ns_apply_budget(&caps, &b), 0);
+	KUNIT_EXPECT_EQ(test, caps.limits.criu, (long)SZ_4M);
+	KUNIT_EXPECT_EQ(test, caps.limits.load_rate, 20L);
+}
+
+static void policy_unpack_test_policyns_apply_child_percent(struct kunit *test)
+{
+	struct aa_ns_budget b = {};
+	struct aa_ns_capset caps;
+
+	aa_ns_capset_init_unset(&caps);
+
+	/* children percentages are stored raw, with the mask beside them */
+	b.target = AA_POLICYNS_TGT_CHILDREN;
+	b.scope = AA_POLICYNS_SCOPE_LOCAL;
+	b.specified = BIT(AA_POLICYNS_KEY_MEMORY) |
+		      BIT(AA_POLICYNS_KEY_PROFILES);
+	b.percent = BIT(AA_POLICYNS_KEY_MEMORY);
+	b.values[AA_POLICYNS_KEY_MEMORY] = 50;
+	b.values[AA_POLICYNS_KEY_PROFILES] = 10;
+	KUNIT_EXPECT_EQ(test, aa_ns_apply_budget(&caps, &b), 0);
+	KUNIT_EXPECT_EQ(test, caps.child.memory, 50L);
+	KUNIT_EXPECT_EQ(test, caps.child.profiles, 10L);
+	KUNIT_EXPECT_EQ(test, caps.child_percent,
+			(u32)BIT(AA_POLICYNS_KEY_MEMORY));
+
+	/* the subtree children template is independent of the local one */
+	b.scope = AA_POLICYNS_SCOPE_SUBTREE;
+	b.specified = BIT(AA_POLICYNS_KEY_MEMORY);
+	b.values[AA_POLICYNS_KEY_MEMORY] = 25;
+	KUNIT_EXPECT_EQ(test, aa_ns_apply_budget(&caps, &b), 0);
+	KUNIT_EXPECT_EQ(test, caps.child_subtree.memory, 25L);
+	KUNIT_EXPECT_EQ(test, caps.child_subtree_percent,
+			(u32)BIT(AA_POLICYNS_KEY_MEMORY));
+	KUNIT_EXPECT_EQ(test, caps.child.memory, 50L);
+
+	/* a later children block replaces its scope's whole template */
+	b.scope = AA_POLICYNS_SCOPE_LOCAL;
+	b.specified = BIT(AA_POLICYNS_KEY_PROFILES);
+	b.percent = 0;
+	b.values[AA_POLICYNS_KEY_PROFILES] = 3;
+	KUNIT_EXPECT_EQ(test, aa_ns_apply_budget(&caps, &b), 0);
+	KUNIT_EXPECT_EQ(test, caps.child.profiles, 3L);
+	KUNIT_EXPECT_EQ(test, caps.child.memory, AA_NS_NOLIMIT);
+	KUNIT_EXPECT_EQ(test, caps.child_percent, (u32)0);
+	KUNIT_EXPECT_EQ(test, caps.child_subtree.memory, 25L);
+}
+
+static void policy_unpack_test_policyns_apply_rejects(struct kunit *test)
+{
+	struct aa_ns_budget b = {};
+	struct aa_ns_capset caps;
+
+	aa_ns_capset_init_unset(&caps);
+
+	/* a percentage on self stays a semantic reject */
+	b.target = AA_POLICYNS_TGT_SELF;
+	b.scope = AA_POLICYNS_SCOPE_LOCAL;
+	b.specified = BIT(AA_POLICYNS_KEY_MEMORY);
+	b.percent = BIT(AA_POLICYNS_KEY_MEMORY);
+	b.values[AA_POLICYNS_KEY_MEMORY] = 50;
+	KUNIT_EXPECT_EQ(test, aa_ns_apply_budget(&caps, &b), -EOPNOTSUPP);
+
+	/* subtree scope is invalid on depth, namespaces and load_rate */
+	b.percent = 0;
+	b.scope = AA_POLICYNS_SCOPE_SUBTREE;
+	b.specified = BIT(AA_POLICYNS_KEY_DEPTH);
+	KUNIT_EXPECT_EQ(test, aa_ns_apply_budget(&caps, &b), -EINVAL);
+	b.specified = BIT(AA_POLICYNS_KEY_NAMESPACES);
+	KUNIT_EXPECT_EQ(test, aa_ns_apply_budget(&caps, &b), -EINVAL);
+	b.specified = BIT(AA_POLICYNS_KEY_LOAD_RATE);
+	KUNIT_EXPECT_EQ(test, aa_ns_apply_budget(&caps, &b), -EINVAL);
+
+	/* routed targets resolve through aa_ns_budget_route(), not here */
+	b.scope = AA_POLICYNS_SCOPE_LOCAL;
+	b.specified = BIT(AA_POLICYNS_KEY_MEMORY);
+	b.target = AA_POLICYNS_TGT_DESCENDANTS;
+	KUNIT_EXPECT_EQ(test, aa_ns_apply_budget(&caps, &b), -EINVAL);
+	b.target = AA_POLICYNS_TGT_ROOT;
+	KUNIT_EXPECT_EQ(test, aa_ns_apply_budget(&caps, &b), -EINVAL);
+	b.target = AA_POLICYNS_TGT_NAME;
+	KUNIT_EXPECT_EQ(test, aa_ns_apply_budget(&caps, &b), -EINVAL);
+
+	/* nothing above may have touched the capset */
+	KUNIT_EXPECT_EQ(test, caps.limits.memory, AA_NS_NOLIMIT);
+	KUNIT_EXPECT_EQ(test, caps.subtree.memory, AA_NS_NOLIMIT);
+	KUNIT_EXPECT_EQ(test, caps.child.memory, AA_NS_NOLIMIT);
+	KUNIT_EXPECT_EQ(test, caps.child_subtree.memory, AA_NS_NOLIMIT);
+}
+
 static struct kunit_case apparmor_policy_unpack_test_cases[] = {
 	KUNIT_CASE(policy_unpack_test_inbounds_when_inbounds),
 	KUNIT_CASE(policy_unpack_test_inbounds_when_out_of_bounds),
@@ -1028,6 +1193,11 @@ static struct kunit_case apparmor_policy_unpack_test_cases[] = {
 	KUNIT_CASE(policy_unpack_test_policyns_header_truncated),
 	KUNIT_CASE(policy_unpack_test_policyns_unterminated_name),
 	KUNIT_CASE(policy_unpack_test_policyns_sequential_blocks),
+	KUNIT_CASE(policy_unpack_test_policyns_percent_over_100),
+	KUNIT_CASE(policy_unpack_test_policyns_percent_not_specified),
+	KUNIT_CASE(policy_unpack_test_policyns_apply_scopes),
+	KUNIT_CASE(policy_unpack_test_policyns_apply_child_percent),
+	KUNIT_CASE(policy_unpack_test_policyns_apply_rejects),
 	{},
 };
 

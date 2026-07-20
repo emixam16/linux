@@ -11,6 +11,7 @@
  * to be loaded for tasks within the namespace.
  */
 
+#include <kunit/visibility.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/ratelimit.h>
@@ -775,6 +776,7 @@ int aa_ns_apply_budget(struct aa_ns_capset *caps, struct aa_ns_budget *b)
 		return -EINVAL;
 	}
 }
+EXPORT_SYMBOL_IF_KUNIT(aa_ns_apply_budget);
 
 /* resolve_percent_caps - resolve raw percentage keys against @base's caps */
 static void resolve_percent_caps(struct aa_ns_caps *caps, u32 percent,
