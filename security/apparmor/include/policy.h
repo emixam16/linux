@@ -260,6 +260,12 @@ AA_POLICYNS_KEY_ASSERT(AA_POLICYNS_KEY_LOAD_RATE, load_rate);
 static_assert(sizeof(struct aa_ns_caps) ==
 	      AA_POLICYNS_KEY_MAX * sizeof(long));
 
+/* keys the subtree scope may aggregate over: sizes and the profile count */
+#define AA_POLICYNS_SUBTREE_KEYS	((1u << AA_POLICYNS_KEY_MEMORY) |    \
+					 (1u << AA_POLICYNS_KEY_MAX_PROFILE) | \
+					 (1u << AA_POLICYNS_KEY_PROFILES) |  \
+					 (1u << AA_POLICYNS_KEY_CRIU))
+
 /* initialise every cap to unset; key-driven so no field can be missed */
 static inline void aa_ns_caps_init_unset(struct aa_ns_caps *c)
 {

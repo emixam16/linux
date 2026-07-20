@@ -202,6 +202,15 @@ static long cap_percent(long base, long pct)
 	return (long)((u64)base * (u64)pct / 100);
 }
 
+/*
+ * Serializes subtree cap updates and whole-chain admissions, so admission
+ * and charge are atomic against concurrent loads anywhere in the subtree.
+ * Ordered strictly before any ns->lock; taken only when subtree caps are in
+ * play (aa_ns_subtree_in_play()), never by uncharges - decrementing is
+ * always the safe direction.
+ */
+DEFINE_MUTEX(aa_ns_subtree_lock);
+
 void aa_ns_acct_init(struct aa_ns *ns)
 {
 	struct aa_ns_acct *acct = &ns->acct;
@@ -338,17 +347,14 @@ int aa_ns_admit_resident(struct aa_ns *ns, struct aa_ns_caps *limits,
 
 /**
  * aa_ns_admit_profile_size - per-profile byte cap (max_profile)
- * @ns: target namespace (audit)
- * @limits: caps to check against, typically the load's tentative caps
+ * @ns: the namespace whose cap is checked (audit attribution)
+ * @limit: the effective max_profile cap in bytes
  * @bytes: the profile's resident size (precomputed by the caller)
  *
  * Returns 0 to admit, -ENOSPC if the profile exceeds max_profile.
  */
-int aa_ns_admit_profile_size(struct aa_ns *ns, struct aa_ns_caps *limits,
-			     long bytes)
+int aa_ns_admit_profile_size(struct aa_ns *ns, long limit, long bytes)
 {
-	long limit = limits->max_profile;
-
 	if (!aa_g_policy_ns_quota || limit == AA_NS_NOLIMIT)
 		return 0;
 	if (bytes > limit)
@@ -372,11 +378,101 @@ int aa_ns_admit_count(struct aa_ns *ns, struct aa_ns_caps *limits, long delta)
 			       &ns->acct.profile_count, delta, -EDQUOT);
 }
 
+/*
+ * effective_max_profile - chain-min of the per-profile byte cap
+ *
+ * A subtree-scoped max_profile bounds every profile loaded below it, so the
+ * effective cap is the min over @pend and every ancestor's standing subtree
+ * cap; *@owner returns the namespace whose cap binds (audit attribution).
+ */
+static long effective_max_profile(struct aa_ns *ns, struct aa_ns_capset *pend,
+				  struct aa_ns **owner)
+{
+	long eff = cap_min(pend->limits.max_profile,
+			   pend->subtree.max_profile);
+	struct aa_ns *a;
+
+	*owner = ns;
+	for (a = ns->parent; a; a = a->parent) {
+		long m = cap_min(eff, a->acct.caps.subtree.max_profile);
+
+		if (m != eff) {
+			eff = m;
+			*owner = a;
+		}
+	}
+	return eff;
+}
+
+/*
+ * admit_subtree_agg - admit a load's net aggregate delta against the chain
+ *
+ * Checks @ns's tentative subtree caps and every ancestor's standing ones
+ * against their aggregates; the caller holds aa_ns_subtree_lock whenever any
+ * of these caps is set.
+ */
+static int admit_subtree_agg(struct aa_ns *ns, struct aa_ns_capset *pend,
+			     long bytes, long profiles)
+{
+	struct aa_ns *a;
+	int error;
+
+	for (a = ns; a; a = a->parent) {
+		struct aa_ns_caps *sc = (a == ns) ? &pend->subtree
+						  : &a->acct.caps.subtree;
+
+		error = cap_admit_delta(a, AA_POLICYNS_KEY_MEMORY, sc->memory,
+					&a->acct.subtree_resident, bytes,
+					-ENOSPC);
+		if (error)
+			return error;
+		error = cap_admit_delta(a, AA_POLICYNS_KEY_PROFILES,
+					sc->profiles,
+					&a->acct.subtree_profile_count,
+					profiles, -EDQUOT);
+		if (error)
+			return error;
+	}
+	return 0;
+}
+
+/**
+ * aa_ns_subtree_in_play - must a load into @ns serialize on the subtree lock
+ * @ns: target namespace of the load
+ * @lh: the load set, a list of struct aa_load_ent
+ *
+ * True if the load carries a subtree-scoped block or the chain up from @ns
+ * has a subtree cap set. The lockless chain scan can miss a cap committed
+ * concurrently; that load then admits against the caps it saw - the same
+ * as a cap lowered below its current usage after the fact.
+ */
+bool aa_ns_subtree_in_play(struct aa_ns *ns, struct list_head *lh)
+{
+	struct aa_load_ent *ent;
+	struct aa_ns *a;
+	int i, k;
+
+	list_for_each_entry(ent, lh, list)
+		for (i = 0; i < ent->new->n_budgets; i++)
+			if (ent->new->budgets[i].scope ==
+			    AA_POLICYNS_SCOPE_SUBTREE)
+				return true;
+
+	for (a = ns; a; a = a->parent) {
+		const long *cap = (const long *)&a->acct.caps.subtree;
+
+		for (k = 0; k < AA_POLICYNS_KEY_MAX; k++)
+			if (READ_ONCE(cap[k]) != AA_NS_NOLIMIT)
+				return true;
+	}
+	return false;
+}
+
 /**
  * aa_ns_admit_load_set - admit a whole replace set against @ns's caps
  * @ns: target namespace
  * @lh: the load set, a list of struct aa_load_ent
- * @limits: the tentative caps the set is admitted against
+ * @pend: the tentative capset the set is admitted against
  * @udata: the load's raw data (for the retained-rawdata memory term)
  * @fail_ent: out - the profile that broke a per-profile cap, or NULL for a
  *	      whole-set (memory/count) breach; only set when denying
@@ -384,25 +480,30 @@ int aa_ns_admit_count(struct aa_ns *ns, struct aa_ns_caps *limits, long delta)
  *
  * Sum the set's net resident bytes and profile count (new minus the dedup-
  * skipped and replaced old), plus any newly retained rawdata, and check the
- * per-profile, memory and count caps, so a breach rejects the set atomically
- * before anything installs. Null profiles count for memory but not the count.
+ * per-profile, memory and count caps - local and subtree-scoped up the
+ * parent chain - so a breach rejects the whole set before anything
+ * installs. Null profiles count for memory but not the count.
  *
- * Requires: @ns->lock held.
+ * Requires: @ns->lock held; aa_ns_subtree_lock held when subtree caps are in
+ *	     play.
  *
  * Returns: 0 to admit the set, or a negative errno with *fail_ent and *info set.
  */
 int aa_ns_admit_load_set(struct aa_ns *ns, struct list_head *lh,
-			 struct aa_ns_caps *limits, struct aa_loaddata *udata,
+			 struct aa_ns_capset *pend, struct aa_loaddata *udata,
 			 struct aa_load_ent **fail_ent, const char **info)
 {
 	long new_bytes = 0, old_bytes = 0;
 	long new_count = 0, old_count = 0;
 	struct aa_load_ent *ent;
+	struct aa_ns *mp_owner;
+	long mp_limit;
 	int error;
 
 	if (!aa_g_policy_ns_quota)
 		return 0;
 
+	mp_limit = effective_max_profile(ns, pend, &mp_owner);
 	list_for_each_entry(ent, lh, list) {
 		long bytes;
 
@@ -412,7 +513,8 @@ int aa_ns_admit_load_set(struct aa_ns *ns, struct list_head *lh,
 
 		bytes = ent->new->resident_size;
 		if (!(ent->new->label.flags & FLAG_NULL)) {
-			error = aa_ns_admit_profile_size(ns, limits, bytes);
+			error = aa_ns_admit_profile_size(mp_owner, mp_limit,
+							 bytes);
 			if (error) {
 				*fail_ent = ent;
 				*info = "profile exceeds max_profile cap";
@@ -436,16 +538,23 @@ int aa_ns_admit_load_set(struct aa_ns *ns, struct list_head *lh,
 	if (!udata->dents[AAFS_LOADDATA_DIR] && aa_g_export_binary)
 		new_bytes += aa_loaddata_resident_size(udata);
 
-	error = aa_ns_admit_resident(ns, limits, new_bytes - old_bytes);
+	error = aa_ns_admit_resident(ns, &pend->limits, new_bytes - old_bytes);
 	if (error) {
 		*fail_ent = NULL;	/* whole-set breach, not one profile */
 		*info = "namespace memory cap exceeded";
 		return error;
 	}
-	error = aa_ns_admit_count(ns, limits, new_count - old_count);
+	error = aa_ns_admit_count(ns, &pend->limits, new_count - old_count);
 	if (error) {
 		*fail_ent = NULL;
 		*info = "namespace profile cap exceeded";
+		return error;
+	}
+	error = admit_subtree_agg(ns, pend, new_bytes - old_bytes,
+				  new_count - old_count);
+	if (error) {
+		*fail_ent = NULL;
+		*info = "subtree cap exceeded";
 		return error;
 	}
 	return 0;
@@ -577,24 +686,34 @@ static void apply_budget_keys(struct aa_ns_caps *dst, struct aa_ns_budget *b,
  */
 int aa_ns_apply_budget(struct aa_ns_capset *caps, struct aa_ns_budget *b)
 {
+	bool subtree = b->scope == AA_POLICYNS_SCOPE_SUBTREE;
+
 	/* Some features remains to be implemented and are rejected with -EOPNOTSUPP. */
-	if (b->scope == AA_POLICYNS_SCOPE_SUBTREE)
-		return -EOPNOTSUPP;
 	if (b->specified & ((1u << AA_POLICYNS_KEY_CRIU) |
 			    (1u << AA_POLICYNS_KEY_LOAD_RATE)))
 		return -EOPNOTSUPP;
+	/* the parser rejects subtree scope on the other keys at parse time */
+	if (subtree && (b->specified & ~AA_POLICYNS_SUBTREE_KEYS))
+		return -EINVAL;
 
 	switch (b->target) {
 	case AA_POLICYNS_TGT_SELF:
 		if (b->percent)		/* % is a per-child ratio only */
 			return -EOPNOTSUPP;
-		apply_budget_keys(&caps->limits, b, true);
+		apply_budget_keys(subtree ? &caps->subtree : &caps->limits, b,
+				  true);
 		return 0;
 	case AA_POLICYNS_TGT_CHILDREN:
-		/* the block is the template: last children block wins */
-		aa_ns_caps_init_unset(&caps->child);
-		apply_budget_keys(&caps->child, b, false);
-		caps->child_percent = b->percent;
+		/* the block is the template for its scope: last block wins */
+		if (subtree) {
+			aa_ns_caps_init_unset(&caps->child_subtree);
+			apply_budget_keys(&caps->child_subtree, b, false);
+			caps->child_subtree_percent = b->percent;
+		} else {
+			aa_ns_caps_init_unset(&caps->child);
+			apply_budget_keys(&caps->child, b, false);
+			caps->child_percent = b->percent;
+		}
 		return 0;
 	default:	/* descendants/root/:NAME: not yet enforced */
 		return -EOPNOTSUPP;
@@ -621,6 +740,7 @@ static void inherit_child_caps(struct aa_ns *child, struct aa_ns *parent)
 	struct aa_ns_caps *cl = &child->acct.caps.limits;
 	struct aa_ns_acct *pa = &parent->acct;
 	struct aa_ns_caps t = parent->acct.caps.child;
+	struct aa_ns_caps st;
 
 	/*
 	 * Resolve percentage keys against the parent's cap in a local copy of
@@ -642,6 +762,17 @@ static void inherit_child_caps(struct aa_ns *child, struct aa_ns *parent)
 	cl->criu = cap_min(t.criu, pl->criu);
 	cl->load_rate = cap_min(t.load_rate, pl->load_rate);
 	cl->depth = cap_min(t.depth, cap_dec(pl->depth));
+
+	/*
+	 * Subtree template: percentages resolve against the parent's own
+	 * subtree cap. No headroom clamp - every ancestor's subtree cap
+	 * already binds the aggregate at each admission - and the child is
+	 * unpublished, so no subtree lock.
+	 */
+	st = parent->acct.caps.child_subtree;
+	resolve_percent_caps(&st, parent->acct.caps.child_subtree_percent,
+			     &parent->acct.caps.subtree);
+	child->acct.caps.subtree = st;
 }
 
 /*

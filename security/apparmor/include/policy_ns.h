@@ -29,22 +29,31 @@ struct apparmor_audit_data;
 #define AA_NS_QUOTA_RATELIMIT_BURST	10
 
 /* struct aa_ns_capset - the standing caps a namespace enforces and stamps
- * @limits: caps enforced against this namespace (self)
+ * @limits: caps enforced against this namespace (self, local scope)
+ * @subtree: caps enforced against this namespace plus all its descendants
  * @child: template caps stamped onto namespaces this namespace creates (children)
+ * @child_subtree: subtree-scope template for created namespaces
  * @child_percent: keys in @child holding a raw percentage (0-100) of the
  *		   parent's corresponding cap, resolved per child at creation
+ * @child_subtree_percent: as @child_percent, for @child_subtree
  */
 struct aa_ns_capset {
 	struct aa_ns_caps limits;
+	struct aa_ns_caps subtree;
 	struct aa_ns_caps child;
+	struct aa_ns_caps child_subtree;
 	u32 child_percent;
+	u32 child_subtree_percent;
 };
 
 static inline void aa_ns_capset_init_unset(struct aa_ns_capset *caps)
 {
 	aa_ns_caps_init_unset(&caps->limits);
+	aa_ns_caps_init_unset(&caps->subtree);
 	aa_ns_caps_init_unset(&caps->child);
+	aa_ns_caps_init_unset(&caps->child_subtree);
 	caps->child_percent = 0;
+	caps->child_subtree_percent = 0;
 }
 
 /* struct aa_ns_acct - per-namespace resource accounting and caps
@@ -143,14 +152,16 @@ int aa_ns_admit_create(struct aa_ns *parent);
 int aa_ns_admit_resident(struct aa_ns *ns, struct aa_ns_caps *limits,
 			 long delta);
 /* per-profile and count admission, under ns->lock */
-int aa_ns_admit_profile_size(struct aa_ns *ns, struct aa_ns_caps *limits,
-			     long bytes);
+int aa_ns_admit_profile_size(struct aa_ns *ns, long limit, long bytes);
 int aa_ns_admit_count(struct aa_ns *ns, struct aa_ns_caps *limits, long delta);
 /* whole replace-set admission, under ns->lock */
 struct aa_load_ent;
 int aa_ns_admit_load_set(struct aa_ns *ns, struct list_head *lh,
-			 struct aa_ns_caps *limits, struct aa_loaddata *udata,
+			 struct aa_ns_capset *pend, struct aa_loaddata *udata,
 			 struct aa_load_ent **fail_ent, const char **info);
+/* serializes subtree-scope cap updates and whole-chain admissions */
+extern struct mutex aa_ns_subtree_lock;
+bool aa_ns_subtree_in_play(struct aa_ns *ns, struct list_head *lh);
 /* apply one parsed "policyns limits" block to a (tentative) capset;
  * returns -EOPNOTSUPP for a construct this kernel does not yet enforce
  */

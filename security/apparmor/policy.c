@@ -1276,6 +1276,7 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 	struct aa_load_ent *ent, *tmp;
 	struct aa_loaddata *rawdata_ent;
 	struct aa_ns_capset pend_caps;
+	bool subtree_locked = false;
 	const char *op;
 	ssize_t count, error;
 	LIST_HEAD(lh);
@@ -1340,6 +1341,11 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 		goto fail;
 	}
 
+	/* whole-chain admission serializes before any ns->lock */
+	if (aa_g_policy_ns_quota && aa_ns_subtree_in_play(ns, &lh)) {
+		mutex_lock(&aa_ns_subtree_lock);
+		subtree_locked = true;
+	}
 	mutex_lock_nested(&ns->lock, ns->level);
 	/* Tentative copy of the ns caps */
 	pend_caps = ns->acct.caps;
@@ -1437,7 +1443,9 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 				error = aa_ns_apply_budget(&pend_caps,
 							   &ent->new->budgets[b]);
 				if (error) {
-					info = "policyns limits: unsupported construct";
+					info = error == -EINVAL ?
+						"policyns limits: invalid construct" :
+						"policyns limits: unsupported construct";
 					goto fail_lock;
 				}
 			}
@@ -1458,8 +1466,7 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 	 * Admission: check the whole load set against the tentative caps
 	 * before installing anything, so a breach rejects the whole set.
 	 */
-	error = aa_ns_admit_load_set(ns, &lh, &pend_caps.limits, udata, &ent,
-				     &info);
+	error = aa_ns_admit_load_set(ns, &lh, &pend_caps, udata, &ent, &info);
 	if (error)
 		goto fail_lock;
 
@@ -1554,6 +1561,8 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 	}
 	__aa_labelset_update_subtree(ns);
 	mutex_unlock(&ns->lock);
+	if (subtree_locked)
+		mutex_unlock(&aa_ns_subtree_lock);
 
 out:
 	aa_put_ns(ns);
@@ -1569,6 +1578,8 @@ out:
 
 fail_lock:
 	mutex_unlock(&ns->lock);
+	if (subtree_locked)
+		mutex_unlock(&aa_ns_subtree_lock);
 
 	/* audit cause of failure */
 	op = (ent && !ent->old) ? OP_PROF_LOAD : OP_PROF_REPL;

@@ -2696,7 +2696,8 @@ static struct aa_sfs_entry aa_sfs_entry_ns_quota[] = {
 	 * Each follow-up that starts enforcing a construct appends its token
 	 * (subtree, criu, load_rate, descendants, root, name, mediation).
 	 */
-	AA_SFS_FILE_STRING("mask", "self children percent local mediation"),
+	AA_SFS_FILE_STRING("mask",
+			   "self children percent local subtree mediation"),
 	{ }
 };
 
