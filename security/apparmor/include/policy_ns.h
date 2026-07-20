@@ -28,6 +28,9 @@ struct apparmor_audit_data;
 #define AA_NS_QUOTA_RATELIMIT_INTERVAL	(5 * HZ)
 #define AA_NS_QUOTA_RATELIMIT_BURST	10
 
+/* the load_rate cap is load/replace operations per minute */
+#define AA_NS_LOAD_RATE_INTERVAL	(60 * HZ)
+
 /* struct aa_ns_capset - the standing caps a namespace enforces and stamps
  * @limits: caps enforced against this namespace (self, local scope)
  * @subtree: caps enforced against this namespace plus all its descendants
@@ -65,6 +68,8 @@ static inline void aa_ns_capset_init_unset(struct aa_ns_capset *caps)
  * @subtree_profile_count: non-null profiles of this ns plus all descendants
  * @criu_resident: retained raw policy bytes charged to this ns (local)
  * @subtree_criu: retained raw policy bytes of this ns plus all descendants
+ * @load_stamp: start (jiffies) of the current load_rate window
+ * @load_count: load/replace operations metered in the current window
  * @ratelimit: bounds OP_NS_QUOTA audit emission
  */
 struct aa_ns_acct {
@@ -76,6 +81,8 @@ struct aa_ns_acct {
 	atomic_long_t subtree_profile_count;
 	atomic_long_t criu_resident;
 	atomic_long_t subtree_criu;
+	unsigned long load_stamp;
+	long load_count;
 	struct ratelimit_state ratelimit;
 };
 
@@ -158,6 +165,8 @@ int aa_ns_admit_resident(struct aa_ns *ns, struct aa_ns_caps *limits,
 /* per-profile and count admission, under ns->lock */
 int aa_ns_admit_profile_size(struct aa_ns *ns, long limit, long bytes);
 int aa_ns_admit_count(struct aa_ns *ns, struct aa_ns_caps *limits, long delta);
+/* load/replace rate meter, under ns->lock */
+int aa_ns_admit_load_rate(struct aa_ns *ns);
 /* whole replace-set admission, under ns->lock */
 struct aa_load_ent;
 int aa_ns_admit_load_set(struct aa_ns *ns, struct list_head *lh,

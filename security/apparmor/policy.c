@@ -1348,6 +1348,14 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 		subtree_locked = true;
 	}
 	mutex_lock_nested(&ns->lock, ns->level);
+	if (aa_g_policy_ns_quota) {
+		error = aa_ns_admit_load_rate(ns);
+		if (error) {
+			info = "namespace load rate exceeded";
+			ent = NULL;
+			goto fail_lock;
+		}
+	}
 	/* Tentative copy of the ns caps */
 	pend_caps = ns->acct.caps;
 	/* check for duplicate rawdata blobs: space and file dedup */

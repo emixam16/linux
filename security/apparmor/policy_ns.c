@@ -224,6 +224,8 @@ void aa_ns_acct_init(struct aa_ns *ns)
 	atomic_long_set(&acct->subtree_profile_count, 0);
 	atomic_long_set(&acct->criu_resident, 0);
 	atomic_long_set(&acct->subtree_criu, 0);
+	acct->load_stamp = 0;
+	acct->load_count = 0;
 	ratelimit_state_init(&acct->ratelimit,
 			     AA_NS_QUOTA_RATELIMIT_INTERVAL,
 			     AA_NS_QUOTA_RATELIMIT_BURST);
@@ -476,6 +478,42 @@ bool aa_ns_subtree_in_play(struct aa_ns *ns, struct list_head *lh)
 }
 
 /**
+ * aa_ns_admit_load_rate - meter a load/replace attempt against load_rate
+ * @ns: target namespace of the load
+ *
+ * Fixed one-minute window, admitting up to two bursts across a boundary.
+ * An attempt is metered whether or not the load later succeeds, and against
+ * the committed cap rather than the load's tentative one, so a load
+ * installing a tighter rate (even 0) is still admitted under the rate it
+ * found.
+ *
+ * Requires: @ns->lock held.
+ *
+ * Returns: 0 to admit, -EAGAIN when the window is exhausted.
+ */
+int aa_ns_admit_load_rate(struct aa_ns *ns)
+{
+	struct aa_ns_acct *acct = &ns->acct;
+	long limit = acct->caps.limits.load_rate;
+
+	if (!aa_g_policy_ns_quota || limit == AA_NS_NOLIMIT)
+		return 0;
+
+	if (!acct->load_count ||
+	    time_after(jiffies, acct->load_stamp + AA_NS_LOAD_RATE_INTERVAL)) {
+		acct->load_stamp = jiffies;
+		acct->load_count = 0;
+	}
+	if (acct->load_count + 1 > limit)
+		return ns_quota_deny(ns, AA_POLICYNS_KEY_LOAD_RATE,
+				     acct->load_count + 1,
+				     cap_remaining(limit, acct->load_count),
+				     -EAGAIN);
+	acct->load_count++;
+	return 0;
+}
+
+/**
  * aa_ns_admit_load_set - admit a whole replace set against @ns's caps
  * @ns: target namespace
  * @lh: the load set, a list of struct aa_load_ent
@@ -710,9 +748,6 @@ int aa_ns_apply_budget(struct aa_ns_capset *caps, struct aa_ns_budget *b)
 {
 	bool subtree = b->scope == AA_POLICYNS_SCOPE_SUBTREE;
 
-	/* Some features remains to be implemented and are rejected with -EOPNOTSUPP. */
-	if (b->specified & (1u << AA_POLICYNS_KEY_LOAD_RATE))
-		return -EOPNOTSUPP;
 	/* the parser rejects subtree scope on the other keys at parse time */
 	if (subtree && (b->specified & ~AA_POLICYNS_SUBTREE_KEYS))
 		return -EINVAL;

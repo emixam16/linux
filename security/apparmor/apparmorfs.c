@@ -1504,6 +1504,7 @@ SEQ_NS_ACCT(acct_namespaces, ns->acct.caps.limits.namespaces);
 SEQ_NS_ACCT(acct_depth, ns->acct.caps.limits.depth);
 SEQ_NS_ACCT(acct_criu, ns->acct.caps.limits.criu);
 SEQ_NS_ACCT(acct_criu_size, atomic_long_read(&ns->acct.criu_resident));
+SEQ_NS_ACCT(acct_load_rate, ns->acct.caps.limits.load_rate);
 
 
 /* policy/raw_data/ * file ops */
@@ -2275,6 +2276,7 @@ static const struct aa_ns_acct_file {
 	{ ".depth",	  &seq_ns_acct_depth_fops,	AAFS_NS_DEPTH },
 	{ ".criu",	  &seq_ns_acct_criu_fops,	AAFS_NS_CRIU },
 	{ ".criu_size",	  &seq_ns_acct_criu_size_fops,	AAFS_NS_CRIU_SIZE },
+	{ ".load_rate",	  &seq_ns_acct_load_rate_fops,	AAFS_NS_LOAD_RATE },
 };
 
 static int __aafs_ns_mkdir_entries(struct aa_ns *ns, struct dentry *dir)
@@ -2698,7 +2700,7 @@ static struct aa_sfs_entry aa_sfs_entry_versions[] = {
  * descendants, root, name, mediation).
  */
 #define NS_QUOTA_MASKSTR \
-	"self children descendants root name percent local subtree criu mediation"
+	"self children descendants root name percent local subtree criu load_rate mediation"
 static struct aa_sfs_entry aa_sfs_entry_ns_quota[] = {
 	AA_SFS_FILE_STRING("mask", NS_QUOTA_MASKSTR),
 	{ }
