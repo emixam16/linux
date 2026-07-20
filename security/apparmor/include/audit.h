@@ -106,6 +106,7 @@ enum audit_type {
 #define OP_USERNS_CREATE "userns_create"
 
 #define OP_NS_QUOTA "ns_quota"
+#define OP_POLICYNS "policyns"
 
 #define OP_URING_OVERRIDE "uring_override"
 #define OP_URING_SQPOLL "uring_sqpoll"

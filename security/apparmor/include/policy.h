@@ -204,6 +204,22 @@ struct aa_ns_caps {
 
 
 /*
+ * Verb permissions for the "policyns" permission rule, encoded on the
+ * AA_CLASS_POLICY_NS state of the class DFA. Wire ABI, MUST match
+ * parser/policyns.h. Kept clear of AA_MAY_READ, which marks the class as
+ * mediated.
+ */
+#define AA_POLICYNS_CREATE	(1 << 3)
+#define AA_POLICYNS_LOAD	(1 << 4)
+#define AA_POLICYNS_REPLACE	(1 << 5)
+#define AA_POLICYNS_REMOVE	(1 << 6)
+#define AA_VALID_POLICYNS_PERMS \
+	(AA_POLICYNS_CREATE | AA_POLICYNS_LOAD | AA_POLICYNS_REPLACE | \
+	 AA_POLICYNS_REMOVE)
+static_assert(!(AA_VALID_POLICYNS_PERMS & AA_MAY_READ),
+	      "policyns verb perms must stay clear of the mediates marker");
+
+/*
  * Wire encoding of a "policyns limits" block. These constants are wire ABI
  * and MUST match parser/policyns.h;
  */
