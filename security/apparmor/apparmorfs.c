@@ -2691,15 +2691,16 @@ static struct aa_sfs_entry aa_sfs_entry_versions[] = {
 };
 
 #define PERMS32STR "allow deny subtree cond kill complain prompt audit quiet hide xindex tag label"
+/*
+ * Space-separated list of the policyns constructs this kernel enforces, so
+ * userspace emits a construct only when it is present. Each follow-up that
+ * starts enforcing a construct appends its token (subtree, criu, load_rate,
+ * descendants, root, name, mediation).
+ */
+#define NS_QUOTA_MASKSTR \
+	"self children descendants root name percent local subtree criu mediation"
 static struct aa_sfs_entry aa_sfs_entry_ns_quota[] = {
-	/*
-	 * Space-separated list of the policyns constructs this kernel
-	 * enforces, so userspace emits a construct only when it is present.
-	 * Each follow-up that starts enforcing a construct appends its token
-	 * (subtree, criu, load_rate, descendants, root, name, mediation).
-	 */
-	AA_SFS_FILE_STRING("mask",
-			   "self children percent local subtree criu mediation"),
+	AA_SFS_FILE_STRING("mask", NS_QUOTA_MASKSTR),
 	{ }
 };
 

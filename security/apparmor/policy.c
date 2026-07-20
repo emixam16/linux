@@ -1280,6 +1280,7 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 	const char *op;
 	ssize_t count, error;
 	LIST_HEAD(lh);
+	LIST_HEAD(routed);
 
 	op = mask & AA_MAY_REPLACE_POLICY ? OP_PROF_REPL : OP_PROF_LOAD;
 	aa_get_profile_loaddata(udata);
@@ -1440,14 +1441,11 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 			int b;
 
 			for (b = 0; b < ent->new->n_budgets; b++) {
-				error = aa_ns_apply_budget(&pend_caps,
-							   &ent->new->budgets[b]);
-				if (error) {
-					info = error == -EINVAL ?
-						"policyns limits: invalid construct" :
-						"policyns limits: unsupported construct";
+				error = aa_ns_stage_budget(ns, &pend_caps,
+							   &ent->new->budgets[b],
+							   &routed, &info);
+				if (error)
 					goto fail_lock;
-				}
 			}
 		}
 	} else {
@@ -1561,10 +1559,13 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 	}
 	__aa_labelset_update_subtree(ns);
 	mutex_unlock(&ns->lock);
+	/* the load committed; stamp its routed budget blocks */
+	aa_ns_budget_stamp_routed(&routed);
 	if (subtree_locked)
 		mutex_unlock(&aa_ns_subtree_lock);
 
 out:
+	aa_ns_budget_free_routed(&routed);
 	aa_put_ns(ns);
 
 	ssize_t udata_sz = udata->size;

@@ -166,6 +166,14 @@ int aa_ns_admit_load_set(struct aa_ns *ns, struct list_head *lh,
 /* serializes subtree-scope cap updates and whole-chain admissions */
 extern struct mutex aa_ns_subtree_lock;
 bool aa_ns_subtree_in_play(struct aa_ns *ns, struct list_head *lh);
+/* stage one budget block: apply self/children to the tentative capset,
+ * queue routed (descendants/root/:NAME:) blocks for post-commit stamping
+ */
+int aa_ns_stage_budget(struct aa_ns *ns, struct aa_ns_capset *pend,
+		       struct aa_ns_budget *b, struct list_head *routed,
+		       const char **info);
+void aa_ns_budget_stamp_routed(struct list_head *routed);
+void aa_ns_budget_free_routed(struct list_head *routed);
 /* apply one parsed "policyns limits" block to a (tentative) capset;
  * returns -EOPNOTSUPP for a construct this kernel does not yet enforce
  */

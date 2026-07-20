@@ -14,6 +14,7 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/ratelimit.h>
+#include <linux/rculist.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 
@@ -735,8 +736,8 @@ int aa_ns_apply_budget(struct aa_ns_capset *caps, struct aa_ns_budget *b)
 			caps->child_percent = b->percent;
 		}
 		return 0;
-	default:	/* descendants/root/:NAME: not yet enforced */
-		return -EOPNOTSUPP;
+	default:	/* routed targets go through aa_ns_budget_route() */
+		return -EINVAL;
 	}
 }
 
@@ -753,35 +754,284 @@ static void resolve_percent_caps(struct aa_ns_caps *caps, u32 percent,
 			cap[k] = cap_percent(b[k], cap[k]);
 }
 
+/*
+ * Budget blocks targeting another namespace (descendants, root, :NAME:)
+ * apply as a two-phase transaction: everything fallible happens in
+ * aa_ns_budget_route() before the load commits, the infallible stamping in
+ * aa_ns_budget_stamp_routed() after the load's ns->lock is released, one
+ * target lock at a time. A namespace created or removed in between is
+ * handled either way: a new one gets the children template, a removed one
+ * is stamped while detached (the routed refs keep it alive).
+ */
+
+/* one routed budget block resolved to its target namespaces */
+struct aa_ns_routed_budget {
+	struct list_head list;
+	struct aa_ns_budget b;		/* value copy; name not carried over */
+	int nr_targets;
+	struct aa_ns *targets[] __counted_by(nr_targets);
+};
+
+/* next namespace in a depth-first walk below @root, NULL when done */
+static struct aa_ns *next_ns_dfs(struct aa_ns *root, struct aa_ns *cur)
+{
+	struct aa_ns *ns;
+
+	ns = list_first_or_null_rcu(&cur->sub_ns, struct aa_ns, base.list);
+	if (ns)
+		return ns;
+	while (cur != root) {
+		ns = list_next_or_null_rcu(&cur->parent->sub_ns,
+					   &cur->base.list, struct aa_ns,
+					   base.list);
+		if (ns)
+			return ns;
+		cur = cur->parent;
+	}
+	return NULL;
+}
+
+/**
+ * aa_ns_budget_route - resolve a routed budget block's targets (fallible)
+ * @ns: the namespace the load carrying @b targets
+ * @b: a budget block aimed at descendants, root or a named namespace
+ * @routed: list the resolved aa_ns_routed_budget is appended to
+ * @info: out - audit cause string; only set when failing
+ *
+ * Requires: @ns->lock held.
+ *
+ * Returns: 0 with the block queued on @routed, or a negative errno.
+ */
+static int aa_ns_budget_route(struct aa_ns *ns, struct aa_ns_budget *b,
+			      struct list_head *routed, const char **info)
+{
+	struct aa_ns_routed_budget *r;
+	struct aa_ns *target, *cur;
+	int n, i;
+
+	/* the parser rejects subtree scope on the other keys at parse time */
+	if (b->scope == AA_POLICYNS_SCOPE_SUBTREE &&
+	    (b->specified & ~AA_POLICYNS_SUBTREE_KEYS)) {
+		*info = "policyns limits: invalid construct";
+		return -EINVAL;
+	}
+
+	switch (b->target) {
+	case AA_POLICYNS_TGT_ROOT:
+		/* only a host policy admin may cap the root namespace, and
+		 * root has no parent to resolve a percentage against
+		 */
+		if (b->percent) {
+			*info = "policyns limits: invalid construct";
+			return -EINVAL;
+		}
+		if (!aa_current_policy_admin_capable(root_ns)) {
+			*info = "policyns limits: not permitted to target the root namespace";
+			return -EPERM;
+		}
+		target = aa_get_ns(root_ns);
+		n = 1;
+		break;
+	case AA_POLICYNS_TGT_NAME:
+		target = aa_lookupn_ns(ns, b->name, strlen(b->name));
+		if (!target) {
+			*info = "policyns limits: target namespace not found";
+			return -ENOENT;
+		}
+		n = 1;
+		break;
+	case AA_POLICYNS_TGT_DESCENDANTS:
+		/* count, then collect refs; the tree may change in between */
+		n = 0;
+		rcu_read_lock();
+		for (cur = next_ns_dfs(ns, ns); cur;
+		     cur = next_ns_dfs(ns, cur))
+			n++;
+		rcu_read_unlock();
+		target = NULL;
+		break;
+	default:
+		*info = "policyns limits: invalid construct";
+		return -EINVAL;
+	}
+
+	r = kzalloc(struct_size(r, targets, n), GFP_KERNEL);
+	if (!r) {
+		aa_put_ns(target);
+		*info = "policyns limits: out of memory";
+		return -ENOMEM;
+	}
+	r->b = *b;
+	r->b.name = NULL;	/* owned by the profile, not needed to stamp */
+	r->nr_targets = n;
+	if (target) {
+		r->targets[0] = target;
+	} else {
+		rcu_read_lock();
+		for (cur = next_ns_dfs(ns, ns), i = 0; cur && i < n;
+		     cur = next_ns_dfs(ns, cur), i++)
+			r->targets[i] = aa_get_ns(cur);
+		rcu_read_unlock();
+		/* the tree may have shrunk between the passes */
+		r->nr_targets = i;
+	}
+	list_add_tail(&r->list, routed);
+	return 0;
+}
+
+/* per-key headroom under @p's local caps: the ceiling for a child's cap
+ * for key @k (parent remaining for the counted keys, cap_dec for depth,
+ * the parent's own cap otherwise). Shared by child inheritance and the
+ * :NAME: routed clamp.
+ */
+static long parent_headroom(struct aa_ns *p, int k)
+{
+	struct aa_ns_caps *pl = &p->acct.caps.limits;
+
+	switch (k) {
+	case AA_POLICYNS_KEY_MEMORY:
+		return cap_remaining(pl->memory,
+				     atomic_long_read(&p->acct.resident));
+	case AA_POLICYNS_KEY_PROFILES:
+		return cap_remaining(pl->profiles,
+				     atomic_long_read(&p->acct.profile_count));
+	case AA_POLICYNS_KEY_NAMESPACES:
+		return cap_remaining(pl->namespaces,
+				     atomic_long_read(&p->acct.ns_count));
+	case AA_POLICYNS_KEY_DEPTH:
+		return cap_dec(pl->depth);
+	default:	/* max_profile, criu, load_rate: the parent's cap */
+		return ((long *)pl)[k];
+	}
+}
+
+/* stamp one routed block onto @t; requires no other ns lock be held */
+static void stamp_routed_budget(struct aa_ns *t, struct aa_ns_budget *b)
+{
+	bool subtree = b->scope == AA_POLICYNS_SCOPE_SUBTREE;
+	struct aa_ns *p = t->parent;
+	struct aa_ns_budget rb = *b;
+	int k;
+
+	/* parent-then-target, the namespace-creation nesting order; root as
+	 * a target has no parent to lock or resolve against
+	 */
+	if (p)
+		mutex_lock_nested(&p->lock, p->level);
+	mutex_lock_nested(&t->lock, t->level);
+	for (k = 0; k < AA_POLICYNS_KEY_MAX; k++) {
+		if (!(rb.specified & (1u << k)))
+			continue;
+		if (rb.percent & (1u << k))
+			rb.values[k] = cap_percent(((const long *)
+					(subtree ? &p->acct.caps.subtree
+						 : &p->acct.caps.limits))[k],
+					rb.values[k]);
+		/*
+		 * :NAME: overwrites and may raise a local cap, but never past
+		 * the parent's remaining headroom - the same limit a new child
+		 * gets - so a child is never granted more than the parent holds.
+		 * Subtree caps stamp as given: every ancestor's subtree cap
+		 * still binds the aggregate at admission.
+		 */
+		if (b->target == AA_POLICYNS_TGT_NAME && !subtree)
+			rb.values[k] = cap_min(rb.values[k],
+					       parent_headroom(p, k));
+	}
+	apply_budget_keys(subtree ? &t->acct.caps.subtree
+				  : &t->acct.caps.limits, &rb,
+			  b->target != AA_POLICYNS_TGT_NAME);
+	mutex_unlock(&t->lock);
+	if (p)
+		mutex_unlock(&p->lock);
+}
+
+/**
+ * aa_ns_budget_stamp_routed - apply resolved routed blocks (infallible)
+ * @routed: list of aa_ns_routed_budget built by aa_ns_budget_route()
+ *
+ * Phase two of the routed transaction; called once the load has committed
+ * and released its ns->lock. Requires aa_ns_subtree_lock be held when any
+ * block carries subtree scope (the load path holds it whenever
+ * aa_ns_subtree_in_play() saw such a block).
+ */
+void aa_ns_budget_stamp_routed(struct list_head *routed)
+{
+	struct aa_ns_routed_budget *r;
+	int i;
+
+	list_for_each_entry(r, routed, list)
+		for (i = 0; i < r->nr_targets; i++)
+			stamp_routed_budget(r->targets[i], &r->b);
+}
+
+/**
+ * aa_ns_budget_free_routed - put the target refs and free a routed list
+ * @routed: list of aa_ns_routed_budget; empty on return
+ */
+void aa_ns_budget_free_routed(struct list_head *routed)
+{
+	struct aa_ns_routed_budget *r, *tmp;
+	int i;
+
+	list_for_each_entry_safe(r, tmp, routed, list) {
+		for (i = 0; i < r->nr_targets; i++)
+			aa_put_ns(r->targets[i]);
+		list_del(&r->list);
+		kfree(r);
+	}
+}
+
+/**
+ * aa_ns_stage_budget - stage one budget block of a policy load
+ * @ns: the namespace the load targets
+ * @pend: the load's tentative capset for @ns
+ * @b: the parsed budget block
+ * @routed: list routed (descendants/root/:NAME:) blocks are queued on
+ * @info: out - audit cause string; only set when failing
+ *
+ * Requires: @ns->lock held.
+ */
+int aa_ns_stage_budget(struct aa_ns *ns, struct aa_ns_capset *pend,
+		       struct aa_ns_budget *b, struct list_head *routed,
+		       const char **info)
+{
+	int error;
+
+	switch (b->target) {
+	case AA_POLICYNS_TGT_SELF:
+	case AA_POLICYNS_TGT_CHILDREN:
+		error = aa_ns_apply_budget(pend, b);
+		if (error)
+			*info = error == -EINVAL ?
+				"policyns limits: invalid construct" :
+				"policyns limits: unsupported construct";
+		return error;
+	default:
+		return aa_ns_budget_route(ns, b, routed, info);
+	}
+}
+
 /* inherit_child_caps - compute a new child's caps from @parent's template */
 static void inherit_child_caps(struct aa_ns *child, struct aa_ns *parent)
 {
 	struct aa_ns_caps *pl = &parent->acct.caps.limits;
-	struct aa_ns_caps *cl = &child->acct.caps.limits;
-	struct aa_ns_acct *pa = &parent->acct;
+	long *cl = (long *)&child->acct.caps.limits;
 	struct aa_ns_caps t = parent->acct.caps.child;
+	long *tp = (long *)&t;
 	struct aa_ns_caps st;
+	int k;
 
 	/*
 	 * Resolve percentage keys against the parent's cap in a local copy of
 	 * the template - never in place - so every child gets the ratio of
-	 * the parent's caps as they stand at its creation.
+	 * the parent's caps as they stand at its creation. Each key is then
+	 * clamped to the headroom left under the parent's own cap, the same
+	 * ceiling the :NAME: routed clamp uses.
 	 */
 	resolve_percent_caps(&t, parent->acct.caps.child_percent, pl);
-
-	cl->memory = cap_min(t.memory,
-			     cap_remaining(pl->memory,
-					   atomic_long_read(&pa->resident)));
-	cl->profiles = cap_min(t.profiles,
-			       cap_remaining(pl->profiles,
-					     atomic_long_read(&pa->profile_count)));
-	cl->namespaces = cap_min(t.namespaces,
-				 cap_remaining(pl->namespaces,
-					       atomic_long_read(&pa->ns_count)));
-	cl->max_profile = cap_min(t.max_profile, pl->max_profile);
-	cl->criu = cap_min(t.criu, pl->criu);
-	cl->load_rate = cap_min(t.load_rate, pl->load_rate);
-	cl->depth = cap_min(t.depth, cap_dec(pl->depth));
+	for (k = 0; k < AA_POLICYNS_KEY_MAX; k++)
+		cl[k] = cap_min(tp[k], parent_headroom(parent, k));
 
 	/*
 	 * Subtree template: percentages resolve against the parent's own
