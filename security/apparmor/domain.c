@@ -506,9 +506,26 @@ out:
 	return &candidate->label;
 }
 
-static const char *next_name(int xtype, const char *name)
+/**
+ * next_name - step to the next name in a transition table entry
+ * @ent: the entry being walked (NOT NULL)
+ * @name: the name within @ent currently being looked at (NOT NULL)
+ *
+ * Stepping past the last name lands on an empty name in a list, and on
+ * the end of the entry in a lone name, so one function serves both. The
+ * bound is the end of the entry rather than ent->count, so that a count
+ * disagreeing with the bytes could not walk off it.
+ *
+ * Returns: the next name, or NULL if @name was the last
+ */
+static const char *next_name(struct aa_str_table_ent *ent, const char *name)
 {
-	return NULL;
+	const char *next = name + strlen(name) + 1;
+
+	if (next >= ent->strs + ent->size || !*next)
+		return NULL;
+
+	return next;
 }
 
 /* the profile list an exec transition attaches against */
@@ -568,7 +585,11 @@ static struct aa_label *x_resolve_elem(struct aa_profile *profile,
 	base = find_attach(path, profile->ns, x_attach_list(profile, xindex),
 			   name, info);
 	if (!base) {
-		*stack = target;
+		/* keep the first: the search fails alike for every element */
+		if (*stack)
+			aa_put_label(target);
+		else
+			*stack = target;
 		return ERR_PTR(-ENOENT);
 	}
 	new = aa_label_merge(base, target, GFP_KERNEL);
@@ -590,6 +611,9 @@ static struct aa_label *x_resolve_elem(struct aa_profile *profile,
  *         set only when NULL is returned
  * @info: info message if there was an error (NOT NULL)
  *
+ * An entry may name the rule's own target followed by its fallbacks, tried
+ * in order; the first that resolves wins.
+ *
  * Returns: refcounted label, NULL if the entry named no loaded profile, or
  *          ERR_PTR if it could not be looked up
  */
@@ -602,19 +626,26 @@ static struct aa_label *x_table_lookup(struct aa_profile *profile, u32 xindex,
 {
 	struct aa_ruleset *rules = profile->label.rules[0];
 	struct aa_label *label, *pending = NULL;
-	u32 xtype = xindex & AA_X_TYPE_MASK;
 	int index = xindex & AA_X_INDEX_MASK;
+	struct aa_str_table_ent *ent;
+	const char *saved_info = *info;
 	const char *next;
 
 	AA_BUG(!lookupname);
 
 	/* index is guaranteed to be in range, validated at load time */
 	/* TODO: move lookup parsing to unpack time so this is a straight
-	 *       index into the resultant label
+	 *       index into the resultant label. Only partly available now:
+	 *       an entry is an ordered list of candidates, and a '&' element
+	 *       needs an attachment base that is not known until exec.
 	 */
-	for (next = rules->file->trans.table[index].strs; next;
-	     next = next_name(xtype, next)) {
-		*lookupname = next;
+	ent = &rules->file->trans.table[index];
+	/* report the target the rule names, not the last fallback tried */
+	*lookupname = ent->strs;
+
+	for (next = ent->strs; next; next = next_name(ent, next)) {
+		/* a stepped-over target did not decide this exec; no-op first pass */
+		*info = saved_info;
 		label = x_resolve_elem(profile, path, name, xindex, next,
 				       &pending, info);
 		/* resolved, or failed for a reason that is not absence */

@@ -539,17 +539,25 @@ VISIBLE_IF_KUNIT int aa_process_strs_entry(char *str, int size, bool multi)
 }
 EXPORT_SYMBOL_IF_KUNIT(aa_process_strs_entry);
 
+/* Bound the names one transition table entry may hold: each is tried at
+ * exec and can search every profile in the namespace, and a 64KB entry
+ * holds thousands. The parser's own limit is not one to rely on - a blob
+ * can be written to .load from a user namespace.
+ */
+#define AA_MAX_TRANS_NAMES 32
+
 /**
  * unpack_strs_table - unpack a profile transition table
  * @e: serialized data extent information  (NOT NULL)
  * @name: name of table (MAY BE NULL)
  * @multi: allow multiple strings on a single entry
+ * @max: most names one entry may hold, or 0 for no limit
  * @strs: str table to unpack to (NOT NULL)
  *
  * Returns: 0 if table successfully unpacked or not present, else error
  */
 static int unpack_strs_table(struct aa_ext *e, const char *name, bool multi,
-			      struct aa_str_table *strs)
+			     int max, struct aa_str_table *strs)
 {
 	void *saved_pos = e->pos;
 	struct aa_str_table_ent *table = NULL;
@@ -585,7 +593,7 @@ static int unpack_strs_table(struct aa_ext *e, const char *name, bool multi,
 			table[i].strs = str;
 			table[i].size = size2;
 			c = aa_process_strs_entry(str, size2, multi);
-			if (c <= 0) {
+			if (c <= 0 || (max && c > max)) {
 				AA_DEBUG(DEBUG_UNPACK, "process_strs %d i %d pos %ld",
 					 c, i,
 					 (unsigned long)(e->pos - saved_pos));
@@ -884,7 +892,7 @@ static int unpack_tags(struct aa_ext *e, struct aa_tags_struct *tags,
 			*info = "invalid tags version";
 			goto fail_reset;
 		}
-		error = unpack_strs_table(e, "strs", true, &tags->strs);
+		error = unpack_strs_table(e, "strs", true, 0, &tags->strs);
 		if (error) {
 			*info = "failed to unpack profile tag.strs";
 			goto fail;
@@ -1085,7 +1093,8 @@ static int unpack_pdb(struct aa_ext *e, struct aa_policydb **policy,
 	 * transition table may be present even when the dfa is
 	 * not. For compatibility reasons unpack and discard.
 	 */
-	error = unpack_strs_table(e, "xtable", false, &pdb->trans);
+	error = unpack_strs_table(e, "xtable", false, AA_MAX_TRANS_NAMES,
+				  &pdb->trans);
 	if (error && required_trans) {
 		*info = "failed to unpack profile transition table";
 		goto fail;
