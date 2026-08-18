@@ -212,6 +212,7 @@ bool aa_unpack_array(struct aa_ext *e, const char *name, u16 *size);
 size_t aa_unpack_blob(struct aa_ext *e, char **blob, const char *name);
 int aa_unpack_str(struct aa_ext *e, const char **string, const char *name);
 int aa_unpack_strdup(struct aa_ext *e, char **string, const char *name);
+int aa_process_strs_entry(char *str, int size, bool multi);
 #endif
 
 #endif /* __POLICY_INTERFACE_H */

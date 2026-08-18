@@ -570,6 +570,132 @@ static void policy_unpack_test_unpack_X_out_of_bounds(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, success);
 }
 
+/* aa_process_strs_entry() rewrites its argument, so copy per case */
+static char *strs_entry_dup(struct kunit *test, const char *bytes, int size)
+{
+	char *buf = kunit_kmalloc(test, size, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	memcpy(buf, bytes, size);
+
+	return buf;
+}
+
+static int strs_entry(struct kunit *test, const char *bytes, int size,
+		      bool multi)
+{
+	return aa_process_strs_entry(strs_entry_dup(test, bytes, size), size,
+				     multi);
+}
+
+/* Separators are explicit so the literal's own terminator supplies the
+ * last one and sizeof() is the wire size: "p" is p\0, "p\0" is p\0\0.
+ */
+#define STRS_ENTRY(test, lit, multi) \
+	strs_entry((test), (lit), sizeof(lit), (multi))
+
+/* singly terminated: one name, the shape of every cache on disk */
+static void policy_unpack_test_strs_entry_single(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "p", false), 1);
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "/t//b", false), 1);
+	/* an embedded \0 without the terminator that would make it a list */
+	KUNIT_EXPECT_LT(test, STRS_ENTRY(test, "p\0q", false), 0);
+}
+
+/* doubly terminated entries are lists, however many names they hold */
+static void policy_unpack_test_strs_entry_list(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "p\0", false), 1);
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "helper\0", false), 1);
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "p\0q\0", false), 2);
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "p\0q\0r\0", false), 3);
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "/t//b\0/t//q\0", false), 2);
+	/* a '&' element is an element like any other to the unpacker */
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "&foo\0bar\0", false), 2);
+}
+
+/* a ':' separator is stored as \0 and rejoined; it does not split names */
+static void policy_unpack_test_strs_entry_ns_rejoin(struct kunit *test)
+{
+	char *buf;
+
+	buf = strs_entry_dup(test, ":ns\0p", sizeof(":ns\0p"));
+	KUNIT_EXPECT_EQ(test,
+			aa_process_strs_entry(buf, sizeof(":ns\0p"), false), 1);
+	KUNIT_EXPECT_STREQ(test, buf, ":ns:p");
+
+	buf = strs_entry_dup(test, ":ns\0p\0q\0", sizeof(":ns\0p\0q\0"));
+	KUNIT_EXPECT_EQ(test,
+			aa_process_strs_entry(buf, sizeof(":ns\0p\0q\0"), false),
+			2);
+	KUNIT_EXPECT_STREQ(test, buf, ":ns:p");
+	KUNIT_EXPECT_STREQ(test, buf + sizeof(":ns:p"), "q");
+
+	/* ":ns:" names a namespace's default profile. Its name does not end
+	 * up empty, so the entry is not a list with a trailing empty name.
+	 */
+	buf = strs_entry_dup(test, ":ns\0\0", sizeof(":ns\0\0"));
+	KUNIT_EXPECT_EQ(test,
+			aa_process_strs_entry(buf, sizeof(":ns\0\0"), false), 1);
+	KUNIT_EXPECT_STREQ(test, buf, ":ns:");
+
+	/* the singly terminated spelling of that same target cannot be told
+	 * apart from a one name list, so it reads as ":ns" - which names the
+	 * same thing, the namespace's default profile
+	 */
+	buf = strs_entry_dup(test, ":ns\0", sizeof(":ns\0"));
+	KUNIT_EXPECT_EQ(test,
+			aa_process_strs_entry(buf, sizeof(":ns\0"), false), 1);
+	KUNIT_EXPECT_STREQ(test, buf, ":ns");
+
+	/* a namespaced name that is not the first, which is what
+	 * "Px -> :ns:p fallback=(:ns:q)" emits
+	 */
+	buf = strs_entry_dup(test, ":ns\0p\0:ns\0q\0",
+			     sizeof(":ns\0p\0:ns\0q\0"));
+	KUNIT_EXPECT_EQ(test,
+			aa_process_strs_entry(buf, sizeof(":ns\0p\0:ns\0q\0"),
+					      false),
+			2);
+	KUNIT_EXPECT_STREQ(test, buf, ":ns:p");
+	KUNIT_EXPECT_STREQ(test, buf + sizeof(":ns:p"), ":ns:q");
+}
+
+/* Exact codes: a bare "< 0" is satisfied by whichever check fires first
+ * and would not notice a rejection rule going missing.
+ */
+static void policy_unpack_test_strs_entry_malformed(struct kunit *test)
+{
+	/* nothing but terminators, in either vintage */
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "", false), -8);
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "\0", false), -8);
+	/* an empty name, leading, interior and trailing */
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "\0q\0", false), -4);
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "p\0\0q\0", false), -4);
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "p\0\0", false), -8);
+	/* a name may not start with whitespace, the first one included */
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, " p\0", false), -5);
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "p\0 q\0", false), -5);
+	/* a sigil with no name after it */
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, ":\0p\0", false), -6);
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "p\0:\0", false), -6);
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "&\0", false), -6);
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "p\0&\0", false), -6);
+	/* an embedded \0 in a single name */
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "p\0q", false), -7);
+	KUNIT_EXPECT_EQ(test, aa_process_strs_entry(NULL, 0, false), -1);
+}
+
+/* the tags table requires a list per entry; only trans detects per entry */
+static void policy_unpack_test_strs_entry_multi(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "p\0", true), 1);
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "p\0q\0", true), 2);
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "p", true), -3);
+	KUNIT_EXPECT_EQ(test, STRS_ENTRY(test, "p\0q", true), -3);
+}
+
 static struct kunit_case apparmor_policy_unpack_test_cases[] = {
 	KUNIT_CASE(policy_unpack_test_inbounds_when_inbounds),
 	KUNIT_CASE(policy_unpack_test_inbounds_when_out_of_bounds),
@@ -601,6 +727,11 @@ static struct kunit_case apparmor_policy_unpack_test_cases[] = {
 	KUNIT_CASE(policy_unpack_test_unpack_X_code_match),
 	KUNIT_CASE(policy_unpack_test_unpack_X_code_mismatch),
 	KUNIT_CASE(policy_unpack_test_unpack_X_out_of_bounds),
+	KUNIT_CASE(policy_unpack_test_strs_entry_single),
+	KUNIT_CASE(policy_unpack_test_strs_entry_list),
+	KUNIT_CASE(policy_unpack_test_strs_entry_ns_rejoin),
+	KUNIT_CASE(policy_unpack_test_strs_entry_malformed),
+	KUNIT_CASE(policy_unpack_test_strs_entry_multi),
 	{},
 };
 

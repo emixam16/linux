@@ -467,23 +467,38 @@ static struct aa_dfa *unpack_dfa(struct aa_ext *e, int flags)
 	return dfa;
 }
 
-static int process_strs_entry(char *str, int size, bool multi)
+/**
+ * aa_process_strs_entry - validate a str table entry and count its names
+ * @str: entry to check, rewritten in place (NOT NULL unless @size <= 0)
+ * @size: bytes in @str, including its terminator(s)
+ * @multi: every entry in this table has to be a list
+ *
+ * A singly \0 terminated entry holds one name, a doubly \0 terminated one a
+ * \0 separated list. That is decided per entry rather than per table:
+ * policy predating exec fallback targets is singly terminated, policy
+ * after it is doubly terminated throughout, and both have to load.
+ *
+ * A ':' namespace separator is stored as a \0 and rejoined here, so it does
+ * not separate two names.
+ *
+ * Returns: number of names in @str, or < 0 if @str is malformed
+ */
+VISIBLE_IF_KUNIT int aa_process_strs_entry(char *str, int size, bool multi)
 {
+	char *save = str;
+	char *pos = str;
+	char *end;
+	bool list;
 	int c = 1;
 
 	if (size <= 0)
 		return -1;
-	if (multi) {
-		if (size < 2)
-			return -2;
-		/* multi ends with double \0 */
-		if (str[size - 2])
-			return -3;
-	}
+	/* a list iff doubly \0 terminated */
+	list = size >= 2 && !str[size - 2];
+	if (multi && !list)
+		return size < 2 ? -2 : -3;
 
-	char *save = str;
-	char *pos = str;
-	char *end = multi ? str + size - 2 : str + size - 1;
+	end = list ? str + size - 2 : str + size - 1;
 	/* count # of internal \0 */
 	while (str < end) {
 		if (str == pos) {
@@ -496,10 +511,8 @@ static int process_strs_entry(char *str, int size, bool multi)
 			}
 			if (isspace(*str))
 				return -5;
-			if (*str == ':') {
-				/* :ns_str\0str\0
-				 * first character after : must be valid
-				 */
+			/* :ns\0name and &stack both need a name after the sigil */
+			if (*str == ':' || *str == '&') {
 				if (!str[1])
 					return -6;
 			}
@@ -513,8 +526,18 @@ static int process_strs_entry(char *str, int size, bool multi)
 		str++;
 	} /* while */
 
+	if (!list && c > 1)
+		/* embedded \0 without the terminator that makes it a list */
+		return -7;
+	/* nothing but terminators, or a list ending in an empty name. A
+	 * rejoined trailing ':' is neither - ":ns:" names a ns default.
+	 */
+	if (pos == end && !(pos > save && pos[-1] == ':'))
+		return -8;
+
 	return c;
 }
+EXPORT_SYMBOL_IF_KUNIT(aa_process_strs_entry);
 
 /**
  * unpack_strs_table - unpack a profile transition table
@@ -561,16 +584,11 @@ static int unpack_strs_table(struct aa_ext *e, const char *name, bool multi,
 			/* publish before validating; the error path frees it */
 			table[i].strs = str;
 			table[i].size = size2;
-			c = process_strs_entry(str, size2, multi);
+			c = aa_process_strs_entry(str, size2, multi);
 			if (c <= 0) {
 				AA_DEBUG(DEBUG_UNPACK, "process_strs %d i %d pos %ld",
 					 c, i,
 					 (unsigned long)(e->pos - saved_pos));
-				goto fail;
-			}
-			if (!multi && c > 1) {
-				AA_DEBUG(DEBUG_UNPACK, "!multi && c > 1");
-				/* fail - all other cases with embedded \0 */
 				goto fail;
 			}
 			table[i].count = c;
