@@ -22,9 +22,6 @@
 #define AA_CHANGE_ONEXEC  4
 #define AA_CHANGE_STACK 8
 
-struct aa_label *x_table_lookup(struct aa_profile *profile, u32 xindex,
-				const char **name);
-
 int apparmor_bprm_creds_for_exec(struct linux_binprm *bprm);
 
 int aa_change_hat(const char *hats[], int count, u64 token, int flags);

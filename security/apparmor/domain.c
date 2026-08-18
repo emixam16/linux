@@ -511,25 +511,102 @@ static const char *next_name(int xtype, const char *name)
 	return NULL;
 }
 
+/* the profile list an exec transition attaches against */
+static struct list_head *x_attach_list(struct aa_profile *profile, u32 xindex)
+{
+	return (xindex & AA_X_CHILD) ? &profile->base.profiles
+				     : &profile->ns->base.profiles;
+}
+
+/**
+ * x_resolve_elem - resolve a single exec transition table element
+ * @profile: current profile (NOT NULL)
+ * @path: path of the executable being transitioned to
+ * @name: name of the executable being transitioned to (NOT NULL)
+ * @xindex: the transition index @elem was taken from
+ * @elem: transition table element to resolve (NOT NULL)
+ * @stack: returns: unmerged stack of a '&' element that found no base
+ * @info: info message if there was an error (NOT NULL)
+ *
+ * A '&' element supplies the stack; its base comes from an attachment
+ * search on the executable path, not from the element. Both are resolved
+ * here so that one element releases everything it took before the next is
+ * tried. When only the base is missing the stack is handed back through
+ * @stack, so an ix or ux composite can still supply one.
+ *
+ * Returns: refcounted label, or ERR_PTR on failure. -ENOENT means @elem
+ *          named no loaded profile, anything else that the lookup failed.
+ */
+static struct aa_label *x_resolve_elem(struct aa_profile *profile,
+				       const struct path *path,
+				       const char *name, u32 xindex,
+				       const char *elem,
+				       struct aa_label **stack,
+				       const char **info)
+{
+	bool is_stack = *elem == '&';
+	const char *lookup = is_stack ? elem + 1 : elem;
+	struct aa_label *target, *base, *new;
+
+	if (xindex & AA_X_CHILD) {
+		/* TODO: switich to parse to get stack of child */
+		struct aa_profile *child = aa_find_child(profile, lookup);
+
+		if (!child)
+			return ERR_PTR(-ENOENT);
+		target = &child->label;
+	} else {
+		target = aa_label_parse(&profile->label, lookup, GFP_KERNEL,
+					true, false);
+		if (IS_ERR(target))
+			return target;
+	}
+	if (!is_stack)
+		/* released by caller */
+		return target;
+
+	base = find_attach(path, profile->ns, x_attach_list(profile, xindex),
+			   name, info);
+	if (!base) {
+		*stack = target;
+		return ERR_PTR(-ENOENT);
+	}
+	new = aa_label_merge(base, target, GFP_KERNEL);
+	aa_put_label(base);
+	aa_put_label(target);
+
+	/* released by caller */
+	return new ?: ERR_PTR(-ENOMEM);
+}
+
 /**
  * x_table_lookup - lookup an x transition name via transition table
  * @profile: current profile (NOT NULL)
  * @xindex: index into x transition table
- * @name: returns: name tested to find label (NOT NULL)
+ * @path: path of the executable being transitioned to
+ * @name: name of the executable being transitioned to (NOT NULL)
+ * @lookupname: returns: name tested to find label (NOT NULL)
+ * @stack: returns: unmerged stack of a '&' element that found no base,
+ *         set only when NULL is returned
+ * @info: info message if there was an error (NOT NULL)
  *
- * Returns: refcounted label, or NULL on failure (MAYBE NULL)
- *          @name will always be set with the last name tried
+ * Returns: refcounted label, NULL if the entry named no loaded profile, or
+ *          ERR_PTR if it could not be looked up
  */
-struct aa_label *x_table_lookup(struct aa_profile *profile, u32 xindex,
-				const char **name)
+static struct aa_label *x_table_lookup(struct aa_profile *profile, u32 xindex,
+				       const struct path *path,
+				       const char *name,
+				       const char **lookupname,
+				       struct aa_label **stack,
+				       const char **info)
 {
 	struct aa_ruleset *rules = profile->label.rules[0];
-	struct aa_label *label = NULL;
+	struct aa_label *label, *pending = NULL;
 	u32 xtype = xindex & AA_X_TYPE_MASK;
 	int index = xindex & AA_X_INDEX_MASK;
 	const char *next;
 
-	AA_BUG(!name);
+	AA_BUG(!lookupname);
 
 	/* index is guaranteed to be in range, validated at load time */
 	/* TODO: move lookup parsing to unpack time so this is a straight
@@ -537,23 +614,18 @@ struct aa_label *x_table_lookup(struct aa_profile *profile, u32 xindex,
 	 */
 	for (next = rules->file->trans.table[index].strs; next;
 	     next = next_name(xtype, next)) {
-		const char *lookup = (*next == '&') ? next + 1 : next;
-		*name = next;
-		if (xindex & AA_X_CHILD) {
-			/* TODO: switich to parse to get stack of child */
-			struct aa_profile *new = aa_find_child(profile, lookup);
-
-			if (new)
-				/* release by caller */
-				return &new->label;
-			continue;
-		}
-		label = aa_label_parse(&profile->label, lookup, GFP_KERNEL,
-				       true, false);
-		if (!IS_ERR_OR_NULL(label))
-			/* release by caller */
+		*lookupname = next;
+		label = x_resolve_elem(profile, path, name, xindex, next,
+				       &pending, info);
+		/* resolved, or failed for a reason that is not absence */
+		if (!IS_ERR(label) || PTR_ERR(label) != -ENOENT) {
+			aa_put_label(pending);
+			/* released by caller */
 			return label;
+		}
 	}
+
+	*stack = pending;
 
 	return NULL;
 }
@@ -566,8 +638,13 @@ struct aa_label *x_table_lookup(struct aa_profile *profile, u32 xindex,
  * @xindex: index into x transition table
  * @lookupname: returns: name used in lookup if one was specified (NOT NULL)
  * @info: info message if there was an error (NOT NULL)
+ * @error: returns: 0, or why the target could not be looked up (NOT NULL)
  *
  * find label for a transition index
+ *
+ * NULL with @error 0 means the target is not loaded, which is what the ix
+ * and ux composites are for. NULL with @error set means the lookup failed,
+ * and answering that with a fallback would weaken confinement.
  *
  * Returns: refcounted label or NULL if not found available
  */
@@ -575,15 +652,15 @@ static struct aa_label *x_to_label(struct aa_profile *profile,
 				   const struct path *path,
 				   const char *name, u32 xindex,
 				   const char **lookupname,
-				   const char **info)
+				   const char **info, int *error)
 {
 	struct aa_label *new = NULL;
 	struct aa_label *stack = NULL;
-	struct aa_ns *ns = profile->ns;
 	u32 xtype = xindex & AA_X_TYPE_MASK;
 	/* Used for info checks during fallback handling */
 	const char *old_info = NULL;
 
+	*error = 0;
 	switch (xtype) {
 	case AA_X_NONE:
 		/* fail exec unless ix || ux fallback - handled by caller */
@@ -591,30 +668,25 @@ static struct aa_label *x_to_label(struct aa_profile *profile,
 		break;
 	case AA_X_TABLE:
 		/* TODO: fix when perm mapping done at unload */
-		/* released by caller
-		 * if null for both stack and direct want to try fallback
-		 */
-		new = x_table_lookup(profile, xindex, lookupname);
-		if (!new || **lookupname != '&')
-			break;
-		stack = new;
-		new = NULL;
-		fallthrough;	/* to X_NAME */
+		/* released by caller */
+		new = x_table_lookup(profile, xindex, path, name, lookupname,
+				     &stack, info);
+		break;
 	case AA_X_NAME:
-		if (xindex & AA_X_CHILD)
-			/* released by caller */
-			new = find_attach(path, ns, &profile->base.profiles,
-					  name, info);
-		else
-			/* released by caller */
-			new = find_attach(path, ns, &ns->base.profiles,
-					  name, info);
+		/* released by caller */
+		new = find_attach(path, profile->ns,
+				  x_attach_list(profile, xindex), name, info);
 		*lookupname = name;
 		break;
 	}
 
-	/* fallback transition check */
-	if (!new) {
+	if (IS_ERR(new)) {
+		*error = PTR_ERR(new);
+		new = NULL;
+	}
+
+	/* fallback transition check - absence only, not a failed lookup */
+	if (!new && !*error) {
 		if (xindex & AA_X_INHERIT) {
 			/* (p|c|n)ix - don't change profile but do
 			 * use the newest version
@@ -653,7 +725,8 @@ static struct aa_label *x_to_label(struct aa_profile *profile,
 		struct aa_label *base = new;
 
 		new = aa_label_merge(base, stack, GFP_KERNEL);
-		/* null on error */
+		if (!new)
+			*error = -ENOMEM;
 		aa_put_label(base);
 	}
 
@@ -675,7 +748,7 @@ static struct aa_label *profile_transition(const struct cred *subj_cred,
 	aa_state_t state = rules->file->start[AA_CLASS_FILE];
 	struct aa_perms perms = {};
 	bool nonewprivs = false;
-	int error = 0;
+	int error = 0, xerror = 0;
 
 	AA_BUG(!profile);
 	AA_BUG(!bprm);
@@ -726,7 +799,7 @@ static struct aa_label *profile_transition(const struct cred *subj_cred,
 	if (perms.allow & MAY_EXEC) {
 		/* exec permission determine how to transition */
 		new = x_to_label(profile, &bprm->file->f_path, name,
-				 perms.xindex, &target, &info);
+				 perms.xindex, &target, &info, &xerror);
 		if (new && new->proxy == profile->label.proxy && info) {
 			/* Force audit on conflicting attachment fallback
 			 * Because perms is never used again after this audit
@@ -738,19 +811,29 @@ static struct aa_label *profile_transition(const struct cred *subj_cred,
 			/* hack ix fallback - improve how this is detected */
 			goto audit;
 		} else if (!new) {
-			if (info) {
-				pr_warn_ratelimited(
-					"AppArmor: %s (from profile %s) audit info \"%s\" dropped on missing transition",
-					__func__, profile->base.hname, info);
-			}
-			info = "profile transition not found";
 			/* remove MAY_EXEC to audit as failure or complaint */
 			perms.allow &= ~MAY_EXEC;
-			if (COMPLAIN_MODE(profile)) {
-				/* create null profile instead of failing */
-				goto create_learning_profile;
+			if (xerror) {
+				/* the target may exist; learning from a
+				 * failed lookup would record the wrong thing
+				 */
+				info = "profile transition lookup failed";
+				error = xerror;
+			} else {
+				if (info)
+					pr_warn_ratelimited("AppArmor: %s (from profile %s) audit info \"%s\" dropped on missing transition",
+							    __func__,
+							    profile->base.hname,
+							    info);
+				info = "profile transition not found";
+				if (COMPLAIN_MODE(profile)) {
+					/* create null profile instead of
+					 * failing
+					 */
+					goto create_learning_profile;
+				}
+				error = -EACCES;
 			}
-			error = -EACCES;
 		}
 	} else if (COMPLAIN_MODE(profile)) {
 create_learning_profile:
