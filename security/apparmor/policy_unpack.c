@@ -1552,8 +1552,11 @@ static bool verify_perms(struct aa_policydb *pdb)
 	for (i = 0; i < pdb->size; i++) {
 		if (!verify_perm(&pdb->perms[i]))
 			return false;
-		/* verify indexes into str table */
-		if ((pdb->perms[i].xindex & AA_X_TYPE_MASK) == AA_X_TABLE) {
+		/* verify indexes into str table. AA_X_NAME_TABLE reaches it
+		 * too, so it must be bounded and counted in xmax or the
+		 * table is freed or shrunk out from under it below.
+		 */
+		if (pdb->perms[i].xindex & AA_X_TABLE) {
 			xidx = pdb->perms[i].xindex & AA_X_INDEX_MASK;
 			if (xidx >= pdb->trans.size)
 				return false;

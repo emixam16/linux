@@ -536,6 +536,19 @@ static struct list_head *x_attach_list(struct aa_profile *profile, u32 xindex)
 }
 
 /**
+ * struct x_attach - the attachment a '&' element stacks on top of
+ * @label: what attached, or NULL if nothing did
+ * @searched: whether the search has been done
+ *
+ * The search walks every profile in the namespace and does not look at the
+ * element, so do it once per exec rather than once per element.
+ */
+struct x_attach {
+	struct aa_label *label;
+	bool searched;
+};
+
+/**
  * x_resolve_elem - resolve a single exec transition table element
  * @profile: current profile (NOT NULL)
  * @path: path of the executable being transitioned to
@@ -543,6 +556,7 @@ static struct list_head *x_attach_list(struct aa_profile *profile, u32 xindex)
  * @xindex: the transition index @elem was taken from
  * @elem: transition table element to resolve (NOT NULL)
  * @stack: returns: unmerged stack of a '&' element that found no base
+ * @attach: the attachment a '&' element stacks on, searched for on demand
  * @info: info message if there was an error (NOT NULL)
  *
  * A '&' element supplies the stack; its base comes from an attachment
@@ -559,11 +573,12 @@ static struct aa_label *x_resolve_elem(struct aa_profile *profile,
 				       const char *name, u32 xindex,
 				       const char *elem,
 				       struct aa_label **stack,
+				       struct x_attach *attach,
 				       const char **info)
 {
 	bool is_stack = *elem == '&';
 	const char *lookup = is_stack ? elem + 1 : elem;
-	struct aa_label *target, *base, *new;
+	struct aa_label *target, *new;
 
 	if (xindex & AA_X_CHILD) {
 		/* TODO: switich to parse to get stack of child */
@@ -582,9 +597,14 @@ static struct aa_label *x_resolve_elem(struct aa_profile *profile,
 		/* released by caller */
 		return target;
 
-	base = find_attach(path, profile->ns, x_attach_list(profile, xindex),
-			   name, info);
-	if (!base) {
+	if (!attach->searched) {
+		/* released by the caller of x_to_label() */
+		attach->label = find_attach(path, profile->ns,
+					    x_attach_list(profile, xindex),
+					    name, info);
+		attach->searched = true;
+	}
+	if (!attach->label) {
 		/* keep the first: the search fails alike for every element */
 		if (*stack)
 			aa_put_label(target);
@@ -592,8 +612,7 @@ static struct aa_label *x_resolve_elem(struct aa_profile *profile,
 			*stack = target;
 		return ERR_PTR(-ENOENT);
 	}
-	new = aa_label_merge(base, target, GFP_KERNEL);
-	aa_put_label(base);
+	new = aa_label_merge(attach->label, target, GFP_KERNEL);
 	aa_put_label(target);
 
 	/* released by caller */
@@ -622,6 +641,7 @@ static struct aa_label *x_table_lookup(struct aa_profile *profile, u32 xindex,
 				       const char *name,
 				       const char **lookupname,
 				       struct aa_label **stack,
+				       struct x_attach *attach,
 				       const char **info)
 {
 	struct aa_ruleset *rules = profile->label.rules[0];
@@ -647,7 +667,7 @@ static struct aa_label *x_table_lookup(struct aa_profile *profile, u32 xindex,
 		/* a stepped-over target did not decide this exec; no-op first pass */
 		*info = saved_info;
 		label = x_resolve_elem(profile, path, name, xindex, next,
-				       &pending, info);
+				       &pending, attach, info);
 		/* resolved, or failed for a reason that is not absence */
 		if (!IS_ERR(label) || PTR_ERR(label) != -ENOENT) {
 			aa_put_label(pending);
@@ -687,6 +707,7 @@ static struct aa_label *x_to_label(struct aa_profile *profile,
 {
 	struct aa_label *new = NULL;
 	struct aa_label *stack = NULL;
+	struct x_attach attach = { };
 	u32 xtype = xindex & AA_X_TYPE_MASK;
 	/* Used for info checks during fallback handling */
 	const char *old_info = NULL;
@@ -701,12 +722,28 @@ static struct aa_label *x_to_label(struct aa_profile *profile,
 		/* TODO: fix when perm mapping done at unload */
 		/* released by caller */
 		new = x_table_lookup(profile, xindex, path, name, lookupname,
-				     &stack, info);
+				     &stack, &attach, info);
 		break;
 	case AA_X_NAME:
 		/* released by caller */
 		new = find_attach(path, profile->ns,
 				  x_attach_list(profile, xindex), name, info);
+		*lookupname = name;
+		break;
+	case AA_X_NAME_TABLE:
+		/* implicit transition with fallbacks: attach, then the entry */
+		/* released by caller */
+		new = find_attach(path, profile->ns,
+				  x_attach_list(profile, xindex), name, info);
+		/* a conflict is a policy error, not a missing target */
+		if (!new && *info != CONFLICTING_ATTACH_STR) {
+			/* the search just failed; '&' elements share it */
+			attach.searched = true;
+			/* released by caller */
+			new = x_table_lookup(profile, xindex, path, name,
+					     lookupname, &stack, &attach, info);
+		}
+		/* no named target, so report the executable as AA_X_NAME does */
 		*lookupname = name;
 		break;
 	}
@@ -762,6 +799,7 @@ static struct aa_label *x_to_label(struct aa_profile *profile,
 	}
 
 	aa_put_label(stack);
+	aa_put_label(attach.label);
 	/* released by caller */
 	return new;
 }

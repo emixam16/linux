@@ -57,6 +57,10 @@ struct aa_file_ctx {
 #define AA_X_NONE		AA_INDEX_NONE
 #define AA_X_NAME		0x04000000 /* use executable name px */
 #define AA_X_TABLE		0x08000000 /* use a specified name ->n# */
+/* the fourth type value: attach as AA_X_NAME, and if that finds nothing
+ * walk the entry as AA_X_TABLE. Both table-reaching types carry AA_X_TABLE.
+ */
+#define AA_X_NAME_TABLE		(AA_X_NAME | AA_X_TABLE)
 
 #define AA_X_UNSAFE		0x10000000
 #define AA_X_CHILD		0x20000000
